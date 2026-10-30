@@ -1,8 +1,8 @@
 {
   "id": "/",
-  "name": "Octop",
-  "short_name": "Octop",
-  "description": "Smarter self-hosted AI assistant — multi-user, multi-agent",
+  "name": "WallTech AI 助手",
+  "short_name": "WallTech",
+  "description": "WallTech 自托管 AI 助手平台 — 多用户、多智能体",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

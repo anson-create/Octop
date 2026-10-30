@@ -373,7 +373,7 @@ html[data-theme="dark"] {
    Default / data-palette="rose" uses the light/dark blocks above.
    =================================================================== */
 
-/* ---------- TECH (#4B74FA) ---------- */
+/* ---------- TECH (#2276DF) ---------- */
 html[data-palette="tech"]:not([data-theme="dark"]) {
   --fn-bg-hover: rgba(75, 116, 250, 0.04);
   --fn-bg-active: rgba(75, 116, 250, 0.08);
@@ -396,17 +396,17 @@ html[data-palette="tech"]:not([data-theme="dark"]) {
   );
   --fn-assistant-bubble-border: rgba(75, 116, 250, 0.12);
   --fn-assistant-glow-color: 75, 116, 250;
-  --fn-tag-channel-text: #4b74fa;
+  --fn-tag-channel-text: #2276df;
   --fn-shadow-brand: 0 4px 14px rgba(75, 116, 250, 0.18);
   --fn-shadow-brand-lg: 0 8px 24px rgba(75, 116, 250, 0.24);
   --fn-row-selected-bg: rgba(75, 116, 250, 0.05);
   --fn-row-selected-hover: rgba(75, 116, 250, 0.09);
   --fn-row-selected-alt-bg: rgba(75, 116, 250, 0.04);
   --fn-row-selected-alt-hover: rgba(75, 116, 250, 0.08);
-  --fn-row-selected-border: #4b74fa;
+  --fn-row-selected-border: #2276df;
   --fn-sidebar-item-active-bg: #f1f4ff;
   --fn-sidebar-item-active: rgba(75, 116, 250, 0.08);
-  --fn-sidebar-item-active-text: #4b74fa;
+  --fn-sidebar-item-active-text: #2276df;
 }
 
 html[data-palette="tech"][data-theme="dark"] {

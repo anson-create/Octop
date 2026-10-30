@@ -276,7 +276,7 @@ export default function LoginPage() {
               ? publicUrl("logo_horizontal_white.png")
               : publicUrl("logo_horizontal_dark.png")
           }
-          alt="Octop"
+          alt="WallTech"
           style={{
             height: 48,
             width: "auto",

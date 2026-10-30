@@ -25,8 +25,8 @@ export const VALID_PALETTES: ThemePalette[] = [
 /** Curated palettes only — "custom" is handled separately via a hex value. */
 export const CURATED_PALETTES: ThemePalette[] = [...VALID_PALETTES];
 
-export const DEFAULT_PALETTE: ThemePalette = "rose";
-export const DEFAULT_CUSTOM_COLOR = "#4B74FA";
+export const DEFAULT_PALETTE: ThemePalette = "tech";
+export const DEFAULT_CUSTOM_COLOR = "#2276DF";
 
 /** True when the value is one of the curated palette keys (not "custom"/hex). */
 export function isCuratedPalette(value: string): value is ThemePalette {
@@ -45,7 +45,7 @@ export const PALETTE_STORAGE_KEY = LEGACY_PALETTE_STORAGE_KEY;
 /** Swatch color shown in the palette picker (light brand). */
 export const PALETTE_SWATCH: Record<ThemePalette, string> = {
   rose: "#E85D75",
-  tech: "#4B74FA",
+  tech: "#2276DF",
   indigo: "#6366F1",
   teal: "#0D9488",
   violet: "#7C3AED",
@@ -112,7 +112,7 @@ export const ANTD_BRAND_TOKENS: Record<
       colorPrimaryActive: "#233FB8",
       colorPrimaryText: "#7B9BFC",
       colorPrimaryTextHover: "#9BB4FD",
-      colorPrimaryTextActive: "#4B74FA",
+      colorPrimaryTextActive: "#2276DF",
       colorLink: "#7B9BFC",
     },
   },
