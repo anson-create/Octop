@@ -180,3 +180,174 @@ export const routes = [
     assert entry is not None
     assert entry.file == "views/customer/index.vue"
     assert entry.size == view.stat().st_size
+
+
+def test_the_preferred_app_settles_a_tenant_versus_admin_duplicate(tmp_path: Path) -> None:
+    """A CargoWareX ticket is a tenant ticket, so the tenant page is the answer."""
+
+    tenant = ROUTES.replace("'订单中心'", "'系统设置'")
+    admin = tenant.replace("views/order", "views/settings")
+    index = RouteIndex.load(
+        _repo(tmp_path, apps={"control-tower": tenant, "platform-admin": admin})
+    )
+    assert index is not None
+
+    entry, candidates = index.resolve("系统设置", prefer=("control-tower",))
+    assert entry is not None
+    assert entry.app == "control-tower"
+    # The other app's route is still reported, so the choice stays auditable.
+    assert {item.app for item in candidates} == {"control-tower", "platform-admin"}
+
+
+def test_the_preferred_app_cannot_settle_two_routes_inside_itself(tmp_path: Path) -> None:
+    """Preference picks between apps. It must never pick between two pages."""
+
+    body = ROUTES.replace("views/home", "views/home/mobile").replace(
+        "订单中心", "系统设置"
+    ) + """
+export const extra = [
+  { path: '/settings', component: () => import('@/views/settings/index.vue'),
+    meta: { title: '系统设置' } },
+]
+"""
+    index = RouteIndex.load(_repo(tmp_path, apps={"control-tower": body}))
+    assert index is not None
+
+    entry, _ = index.resolve("系统设置", prefer=("control-tower",))
+    assert entry is None
+
+
+def test_a_layout_routed_as_home_does_not_beat_the_real_home_page(tmp_path: Path) -> None:
+    """``/`` renders MainLayout and is often titled 首页; it is a frame, not a screen."""
+
+    body = """
+export const routes = [
+  { path: '/', component: () => import('@/layouts/MainLayout.vue'),
+    meta: { title: '首页' } },
+  { path: '/home', component: () => import('@/views/home/index.vue'),
+    meta: { title: '首页' } },
+]
+"""
+    index = RouteIndex.load(_repo(tmp_path, apps={"control-tower": body}))
+    assert index is not None
+
+    entry, candidates = index.resolve("首页")
+    assert entry is not None and entry.file == "views/home/index.vue"
+    assert len(candidates) == 2, "the layout stays in the evidence, not in the answer"
+
+
+VUE2_SEA = """
+import Layout from '@/layout'
+export default {
+  path: '/SeaExport',
+  component: Layout,
+  meta: { title: 'seaExport' },
+  children: [
+    { path: 'BookingNew',
+      component: () => import('@/views/cargo/v0/SeaExport/bookingNew/index.vue'),
+      meta: { title: '订舱中心' } },
+  ]
+}
+"""
+
+VUE2_FBA = """
+export default {
+  path: '/FBA',
+  component: Layout,
+  meta: { title: 'FBA' },
+  children: [
+    { path: 'Warehousing',
+      component: () => import('@/views/cargo/v0/FBA/Warehousing/index.vue'),
+      meta: { title: '国内仓' } },
+  ]
+}
+"""
+
+VUE2_PRICE = """
+export default {
+  path: '/Price',
+  component: Layout,
+  meta: { title: 'price' },
+  children: [
+    { path: 'Quotation',
+      component: () => import('@/views/cargo/v0/Price/Quotation/index.vue'),
+      meta: { title: '报价管理' } },
+  ]
+}
+"""
+
+
+def _vue2_repo(tmp_path: Path) -> Path:
+    root = tmp_path / "cargoware-h5"
+    base = root / "src" / "router" / "modules" / "cargo" / "v0"
+    for module, body in (("SeaExport", VUE2_SEA), ("FBA", VUE2_FBA), ("Price", VUE2_PRICE)):
+        directory = base / module
+        directory.mkdir(parents=True)
+        (directory / "index.js").write_text(body, encoding="utf-8")
+    return root
+
+
+def test_a_single_app_repo_is_read_from_a_nested_module_router(tmp_path: Path) -> None:
+    """Vue 2 keeps one router file per module; reading only the first level finds nothing."""
+
+    index = RouteIndex.load(_vue2_repo(tmp_path))
+    assert index is not None
+    assert "订舱中心" in index.titles
+    entry, _ = index.resolve("国内仓")
+    assert entry is not None
+    assert entry.scope == "FBA"
+
+
+def test_a_vue2_compound_name_resolves_inside_its_own_module(tmp_path: Path) -> None:
+    index = RouteIndex.load(_vue2_repo(tmp_path))
+    assert index is not None
+
+    found = index.match("FBA-国内仓")
+    assert found.reason == "compound"
+    assert found.entry is not None
+    assert found.entry.file == "views/cargo/v0/FBA/Warehousing/index.vue"
+
+
+def test_a_vue2_compound_name_does_not_borrow_another_module(tmp_path: Path) -> None:
+    """报价管理 lives in Price, so ``FBA-报价管理`` is not that page."""
+
+    index = RouteIndex.load(_vue2_repo(tmp_path))
+    assert index is not None
+
+    found = index.match("FBA-报价管理")
+    assert found.entry is None
+
+
+def test_repo_path_is_relative_to_the_repo_root(tmp_path: Path) -> None:
+    """The deriver reads ``root / page`` and hands it to Vite; ``@/`` means nothing."""
+
+    monorepo = RouteIndex.load(_repo(tmp_path))
+    assert monorepo is not None
+    entry, _ = monorepo.resolve("订单中心")
+    assert entry is not None
+    assert monorepo.repo_path(entry) == "control-tower/src/views/order/index.vue"
+
+    single = RouteIndex.load(_vue2_repo(tmp_path))
+    assert single is not None
+    leaf, _ = single.resolve("国内仓")
+    assert leaf is not None
+    assert single.repo_path(leaf) == "src/views/cargo/v0/FBA/Warehousing/index.vue"
+
+
+def test_two_routes_onto_the_same_file_are_an_alias_not_a_tie(tmp_path: Path) -> None:
+    """CargoWare routes 首页 twice, both to dashboard/index.vue. That is one screen."""
+
+    body = """
+export const routes = [
+  { path: '/', component: () => import('@/views/dashboard/index.vue'),
+    meta: { title: '首页' } },
+  { path: '/dashboard', component: () => import('@/views/dashboard/index.vue'),
+    meta: { title: '首页' } },
+]
+"""
+    index = RouteIndex.load(_repo(tmp_path, apps={"control-tower": body}))
+    assert index is not None
+
+    entry, candidates = index.resolve("首页")
+    assert entry is not None and entry.file == "views/dashboard/index.vue"
+    assert len(candidates) == 2, "both routes stay visible as evidence"

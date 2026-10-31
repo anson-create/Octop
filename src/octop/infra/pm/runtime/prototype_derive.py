@@ -33,6 +33,7 @@ from octop.infra.pm.domain.locate_evidence import LocateEvidence
 from octop.infra.pm.domain.repos import RepoSpec
 from octop.infra.pm.ports.graph import GraphHit, GraphIndex
 from octop.infra.pm.ports.i18n import I18nIndex
+from octop.infra.pm.ports.routes import RouteIndex
 from octop.infra.pm.runtime.prototype_source import (
     DerivedPrototype,
     PrototypeDeriver,
@@ -58,6 +59,11 @@ _RENDERABLE_SUFFIXES = (".vue", ".tsx", ".jsx", ".svelte")
 
 # English identifiers embedded in Chinese tickets ("加个 vendorCode 校验").
 _IDENTIFIER_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,40}")
+
+# A routed .vue this small is an entrance shell that imports the real page one
+# level down. Worth naming in the reasons: a reviewer comparing the prototype to
+# the ticket is looking at a wrapper, not the screen.
+_SHELL_BYTES = 1024
 
 # Two candidates this close together means "we cannot tell which page". The
 # caller must then treat the pick as a hypothesis, not a fact.
@@ -195,6 +201,19 @@ def i18n_index(root: Path) -> I18nIndex | None:
 
     path = Path(root)
     return _cached(f"i18n::{root}", path, lambda: I18nIndex.load(path))
+
+
+def route_index(root: Path) -> RouteIndex | None:
+    """The repo's router, or ``None`` when it has none.
+
+    Keyed like the other indexes, so adding a route needs a restart to be seen.
+    That is a stale-answer failure, not a wrong one: a route that exists but is
+    not indexed falls back to the graph, it never produces a page that is not
+    in the router.
+    """
+
+    path = Path(root)
+    return _cached(f"routes::{root}", path, lambda: RouteIndex.load(path))
 
 
 def clear_cache() -> None:
@@ -460,14 +479,119 @@ def _hits_from_evidence(
     return ordered, all_terms
 
 
+def _locate_by_route(
+    routes: RouteIndex,
+    evidence: LocateEvidence | None,
+    *,
+    prefer: tuple[str, ...],
+) -> tuple[PageLocation | None, tuple[str, ...]]:
+    """Ask the router first: a Jira component and a route title are the same word.
+
+    ``None`` means "the router did not answer" and the caller must still try the
+    graph — it does not mean there is no page. Only the component field is
+    consulted, because it is the one structured field a ticket uses to name a
+    functional area; the rest of the ticket is prose, and prose produces
+    candidates the router never had.
+    """
+
+    if evidence is None:
+        return None, ()
+    names = [
+        source.text.strip()
+        for source in evidence.ranked()
+        if source.kind == "component" and source.text.strip()
+    ]
+    if not names:
+        return None, ()
+
+    picked: list[tuple[str, PageCandidate]] = []
+    misses: list[str] = []
+    for name in dict.fromkeys(names):
+        match = routes.match(name, prefer=prefer)
+        if match.entry is not None:
+            entry = match.entry
+            page = routes.repo_path(entry)
+            if not page:
+                misses.append(f"组件「{name}」命中的路由没有页面文件")
+                continue
+            reasons = [f"Jira 组件「{name}」= 路由标题「{entry.title}」（{match.reason}）"]
+            if entry.path:
+                reasons.append(f"路由 {entry.path}")
+            if entry.section:
+                reasons.append("标题是板块，该文件只是板块的默认子页")
+            if 0 < entry.size < _SHELL_BYTES:
+                reasons.append(f"入口壳 {entry.size}B，真页面在它内部 import")
+            picked.append(
+                (
+                    name,
+                    PageCandidate(
+                        source_file=page,
+                        score=10.0,
+                        matched_labels=(entry.title,),
+                        reasons=tuple(reasons),
+                    ),
+                )
+            )
+            continue
+        if match.candidates:
+            apps = "、".join(dict.fromkeys(item.app for item in match.candidates))
+            misses.append(
+                f"组件「{name}」在 {len(match.candidates)} 条同名路由上重复（{apps}），不自动选"
+            )
+        else:
+            misses.append(f"组件「{name}」在路由表里没有同名页面")
+
+    if not picked:
+        return None, tuple(misses)
+
+    pages = {candidate.source_file for _, candidate in picked}
+    if len(pages) > 1:
+        listing = " | ".join(f"{name}→{candidate.source_file}" for name, candidate in picked)
+        return (
+            PageLocation(
+                method="route",
+                notes=(
+                    f"组件的路由指向不同页面，不自动派生：{listing}",
+                    *misses,
+                ),
+            ),
+            (),
+        )
+
+    consensus = len(picked) > 1
+    return (
+        PageLocation(
+            candidates=(picked[0][1],),
+            terms=tuple(name for name, _ in picked),
+            method="route",
+            notes=(
+                "按 Jira 组件名在路由表里定位"
+                + (f"（{len(picked)} 个组件指向同一页面）" if consensus else ""),
+                *misses,
+            ),
+        ),
+        (),
+    )
+
+
 def locate_page(
     root: Path,
     text: str,
     *,
     evidence: LocateEvidence | None = None,
     limit: int = 6,
+    prefer: tuple[str, ...] = (),
 ) -> PageLocation:
     """Find the source file a requirement is about.
+
+    Two anchors, tried in order of how much they are worth:
+
+    1. **The router.** A Jira component named 订单中心 and a route whose
+       ``meta.title`` is 订单中心 are the same words chosen by the product, not
+       a resemblance. On the real CargoWareX mirror this resolves 14 of 15
+       CCTOWER components; the graph resolves 1 of 7 and cannot run at all
+       without ``graph.json``.
+    2. **The code graph**, reached through the product's own i18n catalogue.
 
     When ``evidence`` carries the structured ticket fields, each source is
     searched on its own and weighted. Otherwise the plain ``text`` is treated as
@@ -475,14 +599,21 @@ def locate_page(
     """
 
     repo_root = Path(root)
+    routes = route_index(repo_root)
+    route_notes: tuple[str, ...] = ()
+    if routes is not None:
+        located, route_notes = _locate_by_route(routes, evidence, prefer=prefer)
+        if located is not None:
+            return located
+
     graph = graph_index(repo_root)
     if graph is None:
-        return PageLocation(
-            method="none",
-            notes=("源码仓库还没有代码图谱（graphify-out/graph.json 缺失），无法定位页面",),
-        )
+        notes = ["源码仓库还没有代码图谱（graphify-out/graph.json 缺失），无法定位页面"]
+        if routes is None:
+            notes.append("源码仓库也没有路由表（src/router 不存在），组件名无从锚定")
+        return PageLocation(method="none", notes=(*notes, *route_notes))
 
-    notes: list[str] = []
+    notes: list[str] = list(route_notes)
     catalogue = i18n_index(repo_root)
     if catalogue is None:
         notes.append("源码仓库没有中文 i18n 词表，只能用文中的英文标识符检索")
@@ -576,7 +707,8 @@ def derive_from_source(
     if script is None:
         return DerivationOutcome(ok=False, reason="包内缺少 render.mjs，无法执行 SSR 渲染")
 
-    location = locate_page(root, text, evidence=evidence)
+    prefer = (spec.preferred_app,) if spec.preferred_app else ()
+    location = locate_page(root, text, evidence=evidence, prefer=prefer)
     if not location.ok:
         return DerivationOutcome(
             ok=False,

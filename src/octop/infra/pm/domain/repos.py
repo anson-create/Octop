@@ -59,6 +59,12 @@ class RepoSpec:
     mirror: str = ""
     # Recorded at sync time; empty means "unknown, must be fingerprinted".
     git_ref: str = ""
+    # Which sub-app a requirement belongs to when the mirror is a monorepo. A
+    # CargoWareX ticket is a *tenant* ticket: 系统设置 exists in both the tenant
+    # app and the platform-admin back office, and they are different pages for
+    # different audiences. Empty means the repo has one app and no preference is
+    # needed; it never overrides a genuinely ambiguous match inside that app.
+    preferred_app: str = ""
 
     @property
     def is_web(self) -> bool:
@@ -87,6 +93,7 @@ REPOS: dict[str, RepoSpec] = {
         framework=FRAMEWORK_VUE3,
         ui_lib="arco",
         mirror=f"{_DEFAULT_MIRROR_ROOT}/cwx-platform-admin",
+        preferred_app="control-tower",
     ),
     "cwx-api": RepoSpec(
         key="cwx-api",

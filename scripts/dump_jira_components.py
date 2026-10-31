@@ -64,22 +64,28 @@ def _jql_literal(value: str) -> str:
     return f'"{escaped}"'
 
 
-def _draft_by_route(name: str, routes) -> dict[str, object] | None:  # noqa: ANN001
+def _draft_by_route(  # noqa: ANN001
+    name: str, routes, prefer: tuple[str, ...] = ()
+) -> dict[str, object] | None:
     """The product's own vocabulary. ``None`` means "not found this way"."""
 
-    found = routes.match(name)
+    found = routes.match(name, prefer=prefer)
     if found.ok and found.entry is not None:
         entry = found.entry
         notes = ["路由标题唯一匹配"]
         if found.reason == "compound":
-            notes = ["复合名按「板块-功能」拆解后唯一，且子页确在该板块子树内"]
+            notes = ["复合名按「板块-功能」拆解后唯一，且子页确在该板块内"]
+        if prefer:
+            notes.append(f"同名路由跨子应用时取 {'、'.join(prefer)}")
         if entry.section:
             notes.append("该标题是板块，组件只是它的默认子页")
         if 0 < entry.size < _SHELL_BYTES:
             notes.append(f"入口壳（{entry.size}B），真页面在它内部 import")
         return {
             "status": "suggested",
-            "page": entry.file,
+            # Repo-relative, which is what the deriver reads and what a reviewer
+            # can open. ``entry.file`` is relative to the app's src instead.
+            "page": routes.repo_path(entry),
             "app": entry.app,
             "method": f"route-title:{found.reason}",
             "section": entry.section,
@@ -202,6 +208,11 @@ def main() -> int:
                 print("    （该团队不用组件字段）")
 
             items: list[dict[str, object]] = []
+            # The product fact, not a tie-break: a CCTOWER ticket belongs to the
+            # tenant app, where the same menu name also exists in the admin app.
+            prefer = (binding.web.preferred_app,) if binding and binding.web else ()
+            if prefer and prefer[0]:
+                print(f"    子应用优先：{prefer[0]}（同名菜单优先取它）")
             for component in components:
                 name = component["name"]
                 usage = -1
@@ -213,7 +224,7 @@ def main() -> int:
                     except Exception as exc:  # noqa: BLE001 - a count must not kill the dump
                         print(f"    ! {name} 计数失败：{str(exc)[:80]}")
 
-                draft = _draft_by_route(name, routes) if routes is not None else None
+                draft = _draft_by_route(name, routes, prefer) if routes is not None else None
                 if draft is None:
                     draft = _draft_by_graph(name, root)
 

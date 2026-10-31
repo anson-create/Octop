@@ -567,3 +567,97 @@ def test_the_prototype_step_hands_the_ticket_fields_to_the_deriver() -> None:
     executor.run(_ctx(locate_evidence=evidence))
 
     assert seen["evidence"] is evidence
+
+
+# --- the router as the first anchor ------------------------------------------
+
+ROUTED = """
+export const routes = [
+  { path: '/order', name: 'Order', component: () => import('@/views/order/index.vue'),
+    meta: { title: '订单中心' } },
+  { path: '/vendor', name: 'Vendor', component: () => import('@/views/vendor/index.vue'),
+    meta: { title: '供应商管理' } },
+]
+"""
+
+
+def _routed_repo(tmp_path: Path, *, graph: dict[str, Any] | None = None) -> Path:
+    """A mirror with a router but, unless asked, no code graph at all."""
+
+    root = tmp_path / "routed"
+    router = root / "control-tower" / "src" / "router"
+    router.mkdir(parents=True)
+    (router / "routes.ts").write_text(ROUTED, encoding="utf-8")
+    for name in ("vendor", "order"):
+        page = root / "control-tower" / "src" / "views" / name / "index.vue"
+        page.parent.mkdir(parents=True, exist_ok=True)
+        page.write_text('<template><div class="page"><a-table /></div></template>', encoding="utf-8")
+    if graph is not None:
+        (root / "graphify-out").mkdir(parents=True)
+        (root / "graphify-out" / "graph.json").write_text(
+            json.dumps(graph, ensure_ascii=False), encoding="utf-8"
+        )
+    prototype_derive.clear_cache()
+    return root
+
+
+def test_a_component_resolves_with_no_code_graph_at_all(tmp_path: Path) -> None:
+    """A component and a route title are the same word, so the graph is optional."""
+
+    root = _routed_repo(tmp_path)
+    evidence = LocateEvidence(
+        sources=(EvidenceSource("component", "Jira 组件", "供应商管理", WEIGHT_COMPONENT),)
+    )
+
+    location = locate_page(root, "", evidence=evidence)
+
+    assert location.ok is True
+    assert location.method == "route"
+    # Repo-relative: the deriver reads root/page and then hands it to Vite.
+    assert location.page == "control-tower/src/views/vendor/index.vue"
+    assert location.ambiguous is False
+
+
+def test_the_router_outranks_the_graph_when_both_could_answer(tmp_path: Path) -> None:
+    """The graph matches keywords; the router matches the product's own menu name."""
+
+    root = _routed_repo(
+        tmp_path,
+        graph=_graph_payload({"control-tower/src/views/order/index.vue": ["vendorList"]}),
+    )
+    evidence = LocateEvidence(
+        sources=(
+            EvidenceSource("component", "Jira 组件", "供应商管理", WEIGHT_COMPONENT),
+            EvidenceSource("description", "描述", "供应商列表加就绪状态筛选", WEIGHT_DESCRIPTION),
+        )
+    )
+
+    location = locate_page(root, "", evidence=evidence)
+
+    assert location.method == "route"
+    assert location.page.endswith("views/vendor/index.vue")
+
+
+def test_a_component_the_router_cannot_place_is_reported_not_fabricated(
+    tmp_path: Path,
+) -> None:
+    """No route by that name is a fact about the router, and it gets said out loud."""
+
+    root = _routed_repo(
+        tmp_path,
+        graph=_graph_payload({"control-tower/src/views/order/index.vue": ["vendorList"]}),
+    )
+    evidence = LocateEvidence(
+        sources=(EvidenceSource("component", "Jira 组件", "供应商管理", WEIGHT_COMPONENT),)
+    )
+    # Rename the route so the component has no counterpart.
+    (root / "control-tower" / "src" / "router" / "routes.ts").write_text(
+        ROUTED.replace("供应商管理", "客商管理"), encoding="utf-8"
+    )
+    prototype_derive.clear_cache()
+
+    location = locate_page(root, "", evidence=evidence)
+
+    assert location.method != "route"
+    assert location.ok is False
+    assert any("没有同名页面" in note for note in location.notes)
