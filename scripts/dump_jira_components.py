@@ -166,7 +166,9 @@ def main() -> int:
             return None
         key = str(root)
         if key not in route_cache:
-            route_cache[key] = RouteIndex.load(root)
+            from octop.infra.pm.ports.i18n import I18nIndex
+
+            route_cache[key] = RouteIndex.load(root, i18n=I18nIndex.load(root))
         return route_cache[key]
 
     client = service.jira_client(workspace_id)
