@@ -8,6 +8,7 @@ that a repo cannot: permission-scoped lookups, the export gate sequence
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Sequence
 from contextlib import suppress
 from typing import Any
@@ -33,12 +34,23 @@ def is_enabled() -> bool:
     return os.environ.get(PM_ENABLED_ENV, "1").strip().lower() not in ("0", "false", "off", "no")
 
 
+# A bare issue key is a direct lookup, not a text search: "CCTOWER-3597" as a
+# `text ~` query matches nothing on most DC instances.
+_ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,9}-\d+$")
+
+
+def _looks_like_issue_key(value: str) -> bool:
+    return bool(_ISSUE_KEY_RE.match(value.strip().upper()))
+
+
 class PMService:
     def __init__(self, db: DatabasePool, *, audit: Any | None = None) -> None:
         self._db = db
         self._repos = PmRepos(db)
         self._pipeline = Pipeline(self._repos)
         self._audit = audit
+        # Built on first use: SecretRepo is cheap but tests never touch Jira.
+        self._secrets: Any | None = None
         # Idempotent and cheap; keeps CLI/tests consistent with the server start
         # path without requiring callers to remember a second bootstrap step.
         self._migration_error: str | None = None
@@ -683,6 +695,225 @@ class PMService:
             ],
             "complete": set(self._repos.reviews.verdict_map(task_id)) >= set(PERSPECTIVES),
         }
+
+    # --- jira --------------------------------------------------------------
+
+    def _jira_token_key(self, workspace_id: int) -> str:
+        return f"pm.jira.token.{workspace_id}"
+
+    def _jira_secrets(self) -> Any:
+        if self._secrets is None:
+            from octop.infra.db.repos.secrets import SecretRepo  # noqa: PLC0415
+
+            self._secrets = SecretRepo(self._db)
+        return self._secrets
+
+    def _jira_mapping(self, workspace_id: int) -> dict[str, Any]:
+        item = self._repos.integrations.get_by_vendor(workspace_id, "jira")
+        if item is None:
+            return {}
+        return loads(item.mapping_json, {}) or {}
+
+    def _jira_token(self, workspace_id: int) -> str:
+        raw = self._jira_secrets().get(self._jira_token_key(workspace_id))
+        return raw.decode("utf-8").strip() if raw else ""
+
+    def jira_status(self, workspace_id: int) -> dict[str, Any]:
+        """What the picker needs to know before it tries to list anything."""
+        mapping = self._jira_mapping(workspace_id)
+        item = self._repos.integrations.get_by_vendor(workspace_id, "jira")
+        return {
+            "configured": bool(mapping.get("base_url") and self._jira_token(workspace_id)),
+            "base_url": str(mapping.get("base_url") or ""),
+            "jql": str(mapping.get("jql") or ""),
+            "verify_tls": bool(mapping.get("verify_tls", True)),
+            "token_set": bool(self._jira_token(workspace_id)),
+            "enabled": bool(item.enabled) if item is not None else False,
+            "last_probe_at": getattr(item, "last_probe_at", None) if item is not None else None,
+            "probe_status": getattr(item, "probe_status", None) if item is not None else None,
+        }
+
+    def save_jira_config(
+        self,
+        workspace_id: int,
+        *,
+        base_url: str,
+        token: str | None = None,
+        jql: str | None = None,
+        verify_tls: bool = True,
+    ) -> dict[str, Any]:
+        """Persist the endpoint in the integration row and the PAT in the secret store.
+
+        Splitting them is the whole point: a database dump stays harmless.
+        """
+        if self._repos.workspaces.get(workspace_id) is None:
+            raise errors.not_found("workspace", workspace_id)
+        cleaned = (base_url or "").strip().rstrip("/")
+        if not cleaned:
+            raise errors.invalid("base_url is required")
+        if not cleaned.startswith(("http://", "https://")):
+            raise errors.invalid("base_url must start with http:// or https://")
+
+        mapping = self._jira_mapping(workspace_id)
+        mapping["base_url"] = cleaned
+        mapping["verify_tls"] = bool(verify_tls)
+        if jql is not None:
+            mapping["jql"] = jql.strip()
+
+        key = self._jira_token_key(workspace_id)
+        secrets = self._jira_secrets()
+        if token is not None and token.strip():
+            value = token.strip().encode("utf-8")
+            if secrets.get(key) is None:
+                secrets.get_or_create(key, lambda: value)
+                # get_or_create races are fine; make sure the value we were handed
+                # actually landed rather than a stale one.
+                if secrets.get(key) != value:
+                    secrets.rotate(key, value)
+            else:
+                secrets.rotate(key, value)
+
+        self._repos.integrations.upsert(
+            workspace_id=workspace_id,
+            vendor="jira",
+            enabled=True,
+            mode="real",
+            credential_ref=key,
+            mapping=mapping,
+        )
+        return self.jira_status(workspace_id)
+
+    def jira_client(self, workspace_id: int) -> Any:
+        """Build a client from stored config. Raises PortUnavailable when unset."""
+        from octop.infra.pm.ports.base import PortUnavailable  # noqa: PLC0415
+        from octop.infra.pm.ports.jira import JiraClient  # noqa: PLC0415
+
+        mapping = self._jira_mapping(workspace_id)
+        base_url = str(mapping.get("base_url") or "")
+        token = self._jira_token(workspace_id)
+        if not base_url:
+            raise PortUnavailable("Jira 未配置：请先在设置里填写站点地址与 token")
+        if not token:
+            raise PortUnavailable("Jira token 未设置")
+        return JiraClient(
+            base_url,
+            token,
+            verify_tls=bool(mapping.get("verify_tls", True)),
+        )
+
+    def probe_jira(self, workspace_id: int) -> dict[str, Any]:
+        from octop.infra.pm.ports.base import PortError  # noqa: PLC0415
+
+        item = self._repos.integrations.get_by_vendor(workspace_id, "jira")
+        info: dict[str, Any] = {}
+        try:
+            with self.jira_client(workspace_id) as client:
+                raw = client.probe()
+                if isinstance(raw, dict):
+                    info = raw
+        except PortError as exc:
+            if item is not None:
+                self._repos.integrations.record_probe(item.id, "error")
+            raise errors.invalid(str(exc)) from exc
+        if item is not None:
+            self._repos.integrations.record_probe(item.id, "configured")
+        return info
+
+    def list_jira_issues(
+        self, workspace_id: int, *, q: str | None = None, limit: int = 20
+    ) -> dict[str, Any]:
+        """Candidates for the intake picker. ``q`` is a keyword or a bare issue key."""
+        from octop.infra.pm.ports.base import PortError  # noqa: PLC0415
+        from octop.infra.pm.ports.jira import DEFAULT_JQL  # noqa: PLC0415
+
+        mapping = self._jira_mapping(workspace_id)
+        default_jql = str(mapping.get("jql") or DEFAULT_JQL)
+        needle = (q or "").strip()
+
+        if not needle:
+            jql = f"({default_jql})" if default_jql else "ORDER BY updated DESC"
+        elif _looks_like_issue_key(needle):
+            jql = f'key = "{needle.upper()}"'
+        else:
+            # Quote so a title containing JQL operators cannot rewrite the query.
+            escaped = needle.replace('"', '\\"')
+            jql = f'text ~ "{escaped}" ORDER BY updated DESC'
+
+        try:
+            with self.jira_client(workspace_id) as client:
+                issues = client.search(jql, limit=limit)
+        except PortError as exc:
+            raise errors.invalid(str(exc)) from exc
+        return {"jql": jql, "items": issues, "total": len(issues)}
+
+    def create_requirement_from_jira(
+        self,
+        workspace_id: int,
+        *,
+        issue_key: str,
+        proposer: str | None = None,
+        priority: int | None = None,
+        client_token: str | None = None,
+        actor: str | None = None,
+    ) -> dict[str, Any]:
+        """The only way a requirement is born: an issue that exists in Jira.
+
+        Title and raw text are pulled server-side. Whatever the browser sends for
+        those fields is ignored, so an edited payload cannot invent a requirement
+        that no ticket backs.
+        """
+        from octop.infra.pm.ports.base import PortError  # noqa: PLC0415
+
+        key = (issue_key or "").strip().upper()
+        if not key:
+            raise errors.invalid("issue_key is required")
+
+        # A repeat submit should return the existing requirement, not a 400 from
+        # Jira being briefly unreachable.
+        existing = self._repos.requirements.get_by_source_ref(workspace_id, "jira", key)
+        if existing is not None:
+            return _requirement_payload(existing)
+
+        try:
+            with self.jira_client(workspace_id) as client:
+                issue = client.issue(key)
+        except PortError as exc:
+            raise errors.invalid(str(exc)) from exc
+
+        title = (issue.get("title") or key).strip()
+        description = (issue.get("description") or "").strip()
+        if not description:
+            # G-P1-03 accepts an explicit statement of absence, but an empty raw
+            # text makes every downstream step hallucinate around nothing. Say so
+            # in the text instead of leaving it blank.
+            description = f"（Jira 工单未填写描述；以下事实仅来自标题）{title}"
+
+        # The issue key deliberately stays out of raw_text. Every export runs a
+        # blacklist scan that blocks internal ticket ids, and the intake artifact
+        # embeds this text verbatim — so a key here would make the requirement
+        # permanently un-exportable. The key lives in source_ref and baseline,
+        # which are metadata and never rendered into the deliverable.
+        raw_text = description
+
+        return self.create_requirement(
+            workspace_id=workspace_id,
+            title=title,
+            raw_text=raw_text,
+            source="jira",
+            source_ref=key,
+            proposer=proposer or issue.get("reporter") or None,
+            priority=priority,
+            baseline={
+                "jira_key": key,
+                "jira_status": issue.get("status"),
+                "jira_issue_type": issue.get("issue_type"),
+                "jira_priority": issue.get("priority"),
+                "jira_assignee": issue.get("assignee"),
+                "jira_updated": issue.get("updated"),
+            },
+            client_token=client_token,
+            actor=actor,
+        )
 
     # --- integrations ------------------------------------------------------
 

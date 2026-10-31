@@ -19,6 +19,14 @@ class WorkspaceCreate(BaseModel):
 
 
 class RequirementCreate(BaseModel):
+    """Internal shape. The HTTP contract no longer accepts this — see below.
+
+    Kept because the service layer and tests still build requirements
+    programmatically, and because a future non-Jira intake port will need the same
+    fields. Handing these two strings in over HTTP is exactly the behaviour we
+    removed: nothing verifies that the text corresponds to a real ticket.
+    """
+
     workspace_id: int
     title: str = Field(min_length=1, max_length=300)
     raw_text: str = Field(min_length=1)
@@ -28,6 +36,24 @@ class RequirementCreate(BaseModel):
     priority: int | None = None
     baseline: dict[str, Any] | None = None
     client_token: str | None = None
+
+
+class RequirementFromJira(BaseModel):
+    """Intake by reference: the browser names an issue, the server reads it."""
+
+    workspace_id: int
+    issue_key: str = Field(min_length=1, max_length=64)
+    proposer: str | None = None
+    priority: int | None = None
+    client_token: str | None = None
+
+
+class JiraConfig(BaseModel):
+    base_url: str = Field(min_length=1, max_length=300)
+    # Write-only. Never echoed back — jira_status reports token_set instead.
+    token: str | None = None
+    jql: str | None = None
+    verify_tls: bool = True
 
 
 class ChangeCreate(BaseModel):

@@ -29,7 +29,9 @@ def actor() -> dict[str, FakeUser]:
 
 
 @pytest.fixture
-def client(service: PMService, actor: dict[str, FakeUser]) -> Iterator[TestClient]:
+def client(
+    service: PMService, actor: dict[str, FakeUser], fake_jira: object
+) -> Iterator[TestClient]:
     app = FastAPI()
     app.include_router(pm_router, prefix="/api/pm")
     _install_exception_handlers(app)
@@ -46,14 +48,12 @@ def _grant_decide(actor: dict[str, FakeUser]) -> None:
 
 def _seed(client: TestClient) -> tuple[int, int, int]:
     workspace = client.post("/api/pm/workspaces", json={"name": "默认工作区"}).json()
+    # Intake is by reference: the server reads the issue, the browser only names it.
     requirement = client.post(
         "/api/pm/requirements",
         json={
             "workspace_id": workspace["id"],
-            "title": "报关单批量导入",
-            "raw_text": "客户希望报关单批量导入，单次不超过 200 票，失败要能看到原因，涉及操作员与单证员。",
-            "source": "jira",
-            "source_ref": "CARGO-1234",
+            "issue_key": "CARGO-1234",
         },
     ).json()
     task = client.post("/api/pm/tasks", json={"requirement_id": requirement["id"]}).json()
@@ -104,8 +104,7 @@ def test_requirement_idempotency(client: TestClient) -> None:
     workspace_id, _, _ = _seed(client)
     payload = {
         "workspace_id": workspace_id,
-        "title": "重复提交",
-        "raw_text": "同样的 client_token 应当返回同一资源，避免网络重试重复建单。",
+        "issue_key": "CARGO-5678",
         "client_token": "tok-abc",
     }
     first = client.post("/api/pm/requirements", json=payload).json()

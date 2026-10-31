@@ -605,10 +605,34 @@
       "rejected": "Rejected — the step will run again"
     },
     "newRequirement": {
-      "title": "New requirement",
-      "titlePlaceholder": "One line: what must be solved",
-      "rawPlaceholder": "Paste the original request — the fuller the better",
+      "title": "New requirement from a Jira issue",
+      "subtitle": "A requirement can only come from a real ticket: pick one, and the server reads its title and description itself.",
+      "searchPlaceholder": "Search title/description, or type an issue key (e.g. CCTOWER-3597)",
+      "search": "Search",
+      "reload": "Reload",
+      "empty": "No matching issue",
+      "selectFirst": "Pick an issue first",
+      "selected": "Selected {{key}}",
+      "loadFailed": "Could not read Jira",
+      "noDescription": "This issue has no description",
       "created": "Requirement created"
+    },
+    "jira": {
+      "title": "Connect Jira",
+      "intro": "Jira is not configured yet. Requirements must come from real tickets, so connect the site first.",
+      "baseUrl": "Site URL",
+      "baseUrlHint": "e.g. https://jira.example.com, without /rest",
+      "token": "Personal Access Token",
+      "tokenHint": "Written once: stored in the host secret store, only a reference hits the database",
+      "tokenKeep": "Leave blank to keep the saved token",
+      "jql": "Default JQL filter (optional)",
+      "jqlHint": "Blank lists open issues assigned to me",
+      "verifyTls": "Verify TLS certificate",
+      "connect": "Connect and test",
+      "connected": "Connected: {{user}}",
+      "connectFailed": "Connection failed",
+      "configured": "Jira connected",
+      "reconfigure": "Reconfigure"
     },
     "reflow": {
       "title": "Re-flow from a step",

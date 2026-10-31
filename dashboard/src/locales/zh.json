@@ -605,10 +605,34 @@
       "rejected": "已驳回，将重跑该环节"
     },
     "newRequirement": {
-      "title": "新建需求",
-      "titlePlaceholder": "一句话说清要解决什么",
-      "rawPlaceholder": "把原始需求原文贴进来，越完整越好",
+      "title": "从 Jira 工单新建需求",
+      "subtitle": "需求只能由真实存在的工单派生：选一条工单，标题和描述由服务端自己去 Jira 读。",
+      "searchPlaceholder": "搜索标题/描述，或直接填工单号（如 CCTOWER-3597）",
+      "search": "搜索",
+      "reload": "刷新列表",
+      "empty": "没有匹配的工单",
+      "selectFirst": "先选一条工单",
+      "selected": "已选 {{key}}",
+      "loadFailed": "读取 Jira 失败",
+      "noDescription": "该工单没有填写描述",
       "created": "需求已创建"
+    },
+    "jira": {
+      "title": "连接 Jira",
+      "intro": "还没有配置 Jira。需求必须来自真实工单，先把站点连上。",
+      "baseUrl": "站点地址",
+      "baseUrlHint": "例如 https://jira.example.com，不要带 /rest",
+      "token": "Personal Access Token",
+      "tokenHint": "只写一次：存进宿主密钥库，数据库里只留引用",
+      "tokenKeep": "留空表示沿用已保存的 token",
+      "jql": "默认筛选 JQL（可选）",
+      "jqlHint": "留空则列出分配给我、未完成的工单",
+      "verifyTls": "校验 TLS 证书",
+      "connect": "连接并检测",
+      "connected": "已连接：{{user}}",
+      "connectFailed": "连接失败",
+      "configured": "Jira 已连接",
+      "reconfigure": "重新配置"
     },
     "reflow": {
       "title": "从某环节重跑",

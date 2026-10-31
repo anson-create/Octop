@@ -20,9 +20,10 @@ from octop.infra.pm.api.schemas import (
     AppealResolveRequest,
     ChangeCreate,
     IntegrationUpsert,
+    JiraConfig,
     ReflowRequest,
     RejectRequest,
-    RequirementCreate,
+    RequirementFromJira,
     ReviewCreate,
     TaskCreate,
     TickRequest,
@@ -53,6 +54,58 @@ def get_pm(server: Any = Depends(get_server)) -> PMService:
 @router.get("/health", summary="PM subsystem health")
 async def pm_health(pm: PMService = Depends(get_pm)) -> dict[str, Any]:
     return pm.health()
+
+
+# --- jira ------------------------------------------------------------------
+
+
+@router.get("/jira/status", summary="Is Jira wired up for this workspace")
+async def jira_status(
+    workspace_id: int,
+    pm: PMService = Depends(get_pm),
+    _: Any = Depends(require_permission("pm")),
+) -> dict[str, Any]:
+    return pm.jira_status(workspace_id)
+
+
+@router.post("/jira/config", summary="Save Jira endpoint + token")
+async def jira_config(
+    body: JiraConfig,
+    workspace_id: int,
+    pm: PMService = Depends(get_pm),
+    _: Any = Depends(require_permission("pm_decide")),
+) -> dict[str, Any]:
+    """The token lands in the host secret store; only a reference hits the DB.
+
+    Write-only by design: the response reports ``token_set`` and never the value.
+    """
+    return pm.save_jira_config(
+        workspace_id,
+        base_url=body.base_url,
+        token=body.token,
+        jql=body.jql,
+        verify_tls=body.verify_tls,
+    )
+
+
+@router.post("/jira/probe", summary="Check the stored credentials against Jira")
+async def jira_probe(
+    workspace_id: int,
+    pm: PMService = Depends(get_pm),
+    _: Any = Depends(require_permission("pm_decide")),
+) -> dict[str, Any]:
+    return pm.probe_jira(workspace_id)
+
+
+@router.get("/jira/issues", summary="Candidates for intake")
+async def jira_issues(
+    workspace_id: int,
+    q: str | None = None,
+    limit: int = Query(20, ge=1, le=50),
+    pm: PMService = Depends(get_pm),
+    _: Any = Depends(require_permission("pm")),
+) -> dict[str, Any]:
+    return pm.list_jira_issues(workspace_id, q=q, limit=limit)
 
 
 # --- workspaces ------------------------------------------------------------
@@ -98,21 +151,24 @@ async def list_requirements(
     )
 
 
-@router.post("/requirements", summary="Intake a requirement")
+@router.post("/requirements", summary="Intake a requirement from a Jira issue")
 async def create_requirement(
-    body: RequirementCreate,
+    body: RequirementFromJira,
     pm: PMService = Depends(get_pm),
     user: Any = Depends(require_permission("pm")),
 ) -> dict[str, Any]:
-    return pm.create_requirement(
+    """Intake is by reference only.
+
+    There is deliberately no "title + text" variant: a requirement that no ticket
+    backs is indistinguishable from a model invention, and every downstream step
+    (evidence → analysis → PRD) would inherit that. If a future intake port is
+    needed (KB, form), it gets its own endpoint with its own verification.
+    """
+    return pm.create_requirement_from_jira(
         workspace_id=body.workspace_id,
-        title=body.title,
-        raw_text=body.raw_text,
-        source=body.source,
-        source_ref=body.source_ref,
+        issue_key=body.issue_key,
         proposer=body.proposer,
         priority=body.priority,
-        baseline=body.baseline,
         client_token=body.client_token,
         actor=getattr(user, "username", None),
     )

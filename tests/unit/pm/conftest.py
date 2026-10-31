@@ -49,3 +49,97 @@ def requirement(service: PMService, workspace: dict) -> dict:
 @pytest.fixture
 def task(service: PMService, requirement: dict) -> dict:
     return service.create_task(requirement_id=requirement["id"], owner_user_id=1)
+
+
+_FAKE_ISSUES = {
+    "CARGO-1234": {
+        "key": "CARGO-1234",
+        "title": "报关单批量导入",
+        "description": "客户希望报关单批量导入，单次不超过 200 票，失败要能看到原因，涉及操作员与单证员。",
+        "status": "In Progress",
+        "status_category": "indeterminate",
+        "assignee": "测试员",
+        "reporter": "业务方",
+        "priority": "High",
+        "issue_type": "Story",
+        "project": "CARGO",
+        "resolution": "",
+        "labels": ["报关"],
+        "created": "2026-10-01T09:00:00.000+0800",
+        "updated": "2026-10-30T18:00:00.000+0800",
+    },
+    "CARGO-5678": {
+        "key": "CARGO-5678",
+        "title": "运价指数看板",
+        "description": "按周展示运价指数，支持港口筛选。",
+        "status": "To Do",
+        "status_category": "new",
+        "assignee": "测试员",
+        "reporter": "业务方",
+        "priority": "Medium",
+        "issue_type": "Story",
+        "project": "CARGO",
+        "resolution": "",
+        "labels": [],
+        "created": "2026-10-02T09:00:00.000+0800",
+        "updated": "2026-10-29T18:00:00.000+0800",
+    },
+}
+
+
+class FakeJiraClient:
+    """Stands in for the REST client so contract tests never touch a network.
+
+    Mirrors the real client's surface (context manager, issue, search, probe) so
+    the service code under test is unchanged.
+    """
+
+    def __init__(self, base_url: str = "https://jira.example.com") -> None:
+        self.base_url = base_url
+        self.closed = False
+        self.issues = {key: dict(value) for key, value in _FAKE_ISSUES.items()}
+        self.calls: list[tuple[str, str]] = []
+
+    def __enter__(self) -> FakeJiraClient:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.closed = True
+
+    def close(self) -> None:
+        self.closed = True
+
+    def myself(self) -> dict:
+        return {"displayName": "测试员", "name": "tester"}
+
+    def issue(self, key: str) -> dict:
+        from octop.infra.pm.ports.jira import JiraError
+
+        self.calls.append(("issue", key))
+        item = self.issues.get((key or "").strip().upper())
+        if item is None:
+            raise JiraError("Jira 返回 404：issue 不存在或地址不对")
+        return dict(item)
+
+    def search(self, jql: str, *, limit: int = 20) -> list[dict]:
+        self.calls.append(("search", jql))
+        return [dict(item) for item in list(self.issues.values())[:limit]]
+
+    def probe(self) -> dict:
+        return {
+            "base_url": self.base_url,
+            "user": "测试员",
+            "account": "tester",
+            "default_jql": "assignee = currentUser() AND resolution = Unresolved",
+            "open_assigned": len(self.issues),
+        }
+
+
+@pytest.fixture
+def fake_jira(monkeypatch: pytest.MonkeyPatch) -> FakeJiraClient:
+    """Replace the HTTP client on the service, keeping every other code path real."""
+    client = FakeJiraClient()
+    monkeypatch.setattr(
+        PMService, "jira_client", lambda self, workspace_id: client, raising=True
+    )
+    return client

@@ -304,6 +304,35 @@ export interface PmHealth {
   decisions_due: number;
 }
 
+/** One Jira issue, normalised by the server for the intake picker. */
+export interface PmJiraIssue {
+  key: string;
+  title: string;
+  description: string;
+  status: string;
+  status_category: string;
+  assignee: string;
+  reporter: string;
+  priority: string;
+  issue_type: string;
+  project: string;
+  resolution: string;
+  labels: string[];
+  created: string;
+  updated: string;
+}
+
+export interface PmJiraStatus {
+  configured: boolean;
+  base_url: string;
+  jql: string;
+  verify_tls: boolean;
+  token_set: boolean;
+  enabled: boolean;
+  last_probe_at: string | null;
+  probe_status: string | null;
+}
+
 /** What is waiting on a human right now — drives the sidebar badge. */
 export interface PmInbox {
   enabled: boolean;

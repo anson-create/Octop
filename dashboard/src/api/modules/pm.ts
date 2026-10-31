@@ -8,6 +8,8 @@ import type {
   PmHealth,
   PmInbox,
   PmIntegration,
+  PmJiraIssue,
+  PmJiraStatus,
   PmMetricRow,
   PmPaged,
   PmRequirement,
@@ -68,6 +70,27 @@ export const pmApi = {
   inbox: () => request<PmInbox>("/pm/inbox"),
   sweep: () => request<PmSweepResult>("/pm/internal/sweep", { method: "POST" }),
 
+  // --- jira ---------------------------------------------------------------
+  jiraStatus: (workspaceId: number) =>
+    request<PmJiraStatus>(`/pm/jira/status${qs({ workspace_id: workspaceId })}`),
+  saveJiraConfig: (
+    workspaceId: number,
+    body: { base_url: string; token?: string; jql?: string; verify_tls?: boolean },
+  ) =>
+    request<PmJiraStatus>(
+      `/pm/jira/config${qs({ workspace_id: workspaceId })}`,
+      json(body),
+    ),
+  probeJira: (workspaceId: number) =>
+    request<{ base_url: string; user: string; account: string; open_assigned: number | null }>(
+      `/pm/jira/probe${qs({ workspace_id: workspaceId })}`,
+      { method: "POST" },
+    ),
+  listJiraIssues: (workspaceId: number, q?: string, limit = 20) =>
+    request<{ jql: string; items: PmJiraIssue[]; total: number }>(
+      `/pm/jira/issues${qs({ workspace_id: workspaceId, q: q || undefined, limit })}`,
+    ),
+
   // --- workspaces ---------------------------------------------------------
   listWorkspaces: () => request<{ items: PmWorkspace[] }>("/pm/workspaces"),
   createWorkspace: (body: {
@@ -79,15 +102,13 @@ export const pmApi = {
   // --- requirements -------------------------------------------------------
   listRequirements: (query: PmRequirementQuery = {}) =>
     request<PmPaged<PmRequirement>>(`/pm/requirements${qs({ ...query })}`),
+  // Intake is by reference only: the server reads the issue from Jira and builds
+  // the requirement itself. There is no title/raw_text variant by design.
   createRequirement: (body: {
     workspace_id: number;
-    title: string;
-    raw_text: string;
-    source?: string;
-    source_ref?: string;
+    issue_key: string;
     proposer?: string;
     priority?: number;
-    baseline?: Record<string, unknown>;
     client_token?: string;
   }) => request<PmRequirement>("/pm/requirements", json(body)),
   getRequirement: (requirementId: number) =>
