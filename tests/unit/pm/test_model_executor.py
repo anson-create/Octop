@@ -219,6 +219,37 @@ def test_supports_only_the_nine_model_steps() -> None:
         assert not executor.supports(key)
 
 
+def test_sequential_calls_reuse_one_live_loop() -> None:
+    """Regression: a fresh loop per call closed the provider client's loop.
+
+    On the live instance step 2 passed and step 3 died with "Event loop is closed".
+    Every model call must therefore run on the same, still-open loop.
+    """
+    import asyncio
+
+    seen: list[Any] = []
+
+    class LoopRecorder:
+        async def ainvoke_text(self, prompt: str, **kwargs: Any) -> str:
+            seen.append(asyncio.get_running_loop())
+            for marker, payload in SCRIPT:
+                if marker in prompt:
+                    return payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+            raise AssertionError("unscripted prompt")
+
+    class RecorderFactory:
+        def get(self, model: str | None = None) -> LoopRecorder:
+            return LoopRecorder()
+
+    executor = ModelStepExecutor(models_provider=RecorderFactory)
+    for key in ("link_expand", "requirement_analysis", "code"):
+        assert executor.run(_ctx(key)).status == "passed"
+
+    assert len(seen) >= 3
+    assert len({id(loop) for loop in seen}) == 1, "model calls must share one loop"
+    assert not seen[0].is_closed()
+
+
 # --- end to end -------------------------------------------------------------
 
 

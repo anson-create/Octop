@@ -20,9 +20,9 @@ through a private loop instead of ``asyncio.run`` (which would raise inside Fast
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import json
 import re
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -157,6 +157,48 @@ def _loads_object(text: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+class _ModelLoop:
+    """One long-lived event loop for every model call.
+
+    A fresh ``asyncio.run`` per call closes the loop that the provider's HTTP client
+    bound its connection pool to, and the *next* step dies with "Event loop is closed"
+    — observed on a live run at step 3. One kept-alive loop keeps client lifetime and
+    loop lifetime aligned.
+    """
+
+    _instance: _ModelLoop | None = None
+    _instance_guard = threading.Lock()
+
+    def __init__(self) -> None:
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._lock = threading.Lock()
+
+    @classmethod
+    def shared(cls) -> _ModelLoop:
+        with cls._instance_guard:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
+    @staticmethod
+    def _spin(loop: asyncio.AbstractEventLoop) -> None:
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    def _ensure(self) -> asyncio.AbstractEventLoop:
+        with self._lock:
+            if self._loop is None or self._loop.is_closed():
+                loop = asyncio.new_event_loop()
+                threading.Thread(
+                    target=self._spin, args=(loop,), daemon=True, name="pm-model-loop"
+                ).start()
+                self._loop = loop
+            return self._loop
+
+    def run(self, coro: Any) -> Any:
+        return asyncio.run_coroutine_threadsafe(coro, self._ensure()).result()
+
+
 def _checkable(acceptance: str, fallback_title: str) -> str:
     """Re-phrase acceptance into the shape the P2 gate machine-checks.
 
@@ -234,12 +276,12 @@ class ModelStepExecutor:
     # --- model plumbing -----------------------------------------------------
 
     def _await(self, coro: Any) -> Any:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(coro)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(asyncio.run, coro).result()
+        """Run an async model call from the synchronous pipeline.
+
+        Always through the shared loop: mixing ``asyncio.run`` here with a caller that
+        already owns a loop is what produced "Event loop is closed" on the live run.
+        """
+        return _ModelLoop.shared().run(coro)
 
     def _access(self) -> Any:
         if self._models_provider is None:
