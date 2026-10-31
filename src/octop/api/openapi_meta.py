@@ -64,6 +64,10 @@ OPENAPI_TAGS: list[dict[str, str]] = [
     },
     {"name": "auth", "description": "Sign in, sign out, and manage the current user profile."},
     {"name": "health", "description": "Liveness probe for load balancers and monitoring."},
+    {
+        "name": "pm",
+        "description": "PM 需求方案工作台: requirements, pipeline steps, evidence, decisions, exports.",
+    },
     {"name": "users", "description": "Admin user management, roles, and user groups."},
     {
         "name": "agents",

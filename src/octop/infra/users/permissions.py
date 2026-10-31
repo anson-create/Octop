@@ -58,6 +58,7 @@ PERMISSIONS: dict[str, PermissionDef] = {
     "experts": _p("experts", "nav", "专家", "Experts"),
     "tasks": _p("tasks", "nav", "自动化", "Automation"),
     "token_usage": _p("token_usage", "nav", "Token 统计", "Token usage"),
+    "pm": _p("pm", "nav", "需求方案", "PM workspace"),
     # --- settings (nav.settings) — listed & default-selected for new users ---
     # Personalization tabs. ``channels`` is also a sidebar item; the rest are
     # tabs on the personalization page. ``agent_plugins`` is per-agent plugin
@@ -144,6 +145,8 @@ PERMISSIONS: dict[str, PermissionDef] = {
     "bridge": _p("bridge", "settings", "云端协同", "Cloud collab"),
     # --- control (nav.control) — page/tab labels ---
     "terminal": _p("terminal", "control", "工作台/终端", "Workbench / Terminal"),
+    # PM: reading the board is ``pm``; deciding/rejecting/reviewing is this key.
+    "pm_decide": _p("pm_decide", "control", "需求方案/拍板", "PM / Decisions"),
     "browser": _p("browser", "control", "工作台/浏览器", "Workbench / Browser"),
     "desktop": _p("desktop", "control", "远程桌面", "Remote Desktop"),
     "mobile": _p("mobile", "control", "远程手机", "Remote Phone"),

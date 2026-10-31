@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import {
   Monitor,
   MessageSquareText,
+  ClipboardList,
   Timer,
   SlidersHorizontal,
   Waypoints,
@@ -66,6 +67,7 @@ export interface NavSection {
 /** Every nav item key the sidebar can show. Keep in sync with `SIDEBAR_NAV_KEYS` in `octop.infra.users.preferences`. */
 export const SIDEBAR_NAV_KEYS = [
   "chat",
+  "pm",
   "experts",
   "tasks",
   "token-usage",
@@ -159,6 +161,14 @@ export function buildNavSections(
       labelKey: "nav.chat",
     },
   ];
+  if (navAllowed(user, "pm")) {
+    topItems.push({
+      key: "pm",
+      path: "/pm",
+      icon: <ClipboardList size={iconSize} strokeWidth={iconStroke} />,
+      labelKey: "nav.pm",
+    });
+  }
   if (navAllowed(user, "experts")) {
     topItems.push({
       key: "experts",

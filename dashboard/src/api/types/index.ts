@@ -9,3 +9,4 @@ export * from "./skill";
 export * from "./workspace";
 export * from "./browser";
 export * from "./mbti";
+export * from "./pm";

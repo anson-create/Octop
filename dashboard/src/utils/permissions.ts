@@ -71,6 +71,8 @@ export const PERM = {
   experts: ["experts"],
   tasks: ["tasks"],
   tokenUsage: ["token_usage"],
+  pm: ["pm"],
+  pmDecide: ["pm_decide"],
 } as const satisfies Record<string, readonly string[]>;
 
 /** Sidebar item key → permission keys. Shared with path guards. */
@@ -96,6 +98,7 @@ export const PLUGIN_TAB_PERMISSIONS = {
 } as const;
 
 export const NAV_PERMISSIONS = {
+  pm: PERM.pm,
   experts: PERM.experts,
   tasks: PERM.tasks,
   "token-usage": PERM.tokenUsage,
@@ -312,6 +315,9 @@ export function pathPermissionKeys(pathname: string): PermissionKeys | null {
   }
   if (pathname === "/experts" || pathname.startsWith("/experts/")) {
     return PERM.experts;
+  }
+  if (pathname === "/pm" || pathname.startsWith("/pm/")) {
+    return PERM.pm;
   }
   if (pathname === "/tasks" || pathname.startsWith("/tasks/")) {
     return PERM.tasks;

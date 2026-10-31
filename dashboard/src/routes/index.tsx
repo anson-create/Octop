@@ -14,6 +14,16 @@ const PersonalizationPage = lazy(
 const ACPPage = lazy(() => import("../pages/Agent/ACP"));
 const TokenUsagePage = lazy(() => import("../pages/Control/TokenUsage"));
 
+// Lazy-loaded pages — PM workspace (需求方案)
+const PMPage = lazy(() => import("../pages/PM"));
+const PMRequirementDetailPage = lazy(
+  () => import("../pages/PM/RequirementDetail"),
+);
+const PMTaskWorkspacePage = lazy(() => import("../pages/PM/TaskWorkspace"));
+const PMDecisionCenterPage = lazy(
+  () => import("../pages/PM/DecisionCenter"),
+);
+
 // Lazy-loaded pages — Control
 const RemoteDesktopPage = lazy(() => import("../pages/Control/RemoteDesktop"));
 
@@ -49,6 +59,8 @@ export interface RouteConfig {
 export const pathToKey: Record<string, string> = {
   "/chat": "chat",
   // Common
+  "/pm": "pm",
+  "/pm/decisions": "pm",
   "/experts": "experts",
   "/tasks": "tasks",
   "/connectors": "connectors",
@@ -137,6 +149,7 @@ export function isPersonalizationPath(pathname: string): boolean {
 export function resolveSelectedKey(pathname: string): string {
   if (pathToKey[pathname]) return pathToKey[pathname];
   if (pathname.startsWith("/chat/")) return "chat";
+  if (pathname.startsWith("/pm/")) return "pm";
   if (pathname.startsWith("/workbench/")) return "workbench";
   if (pathname.startsWith("/remote-desktop/")) return "remote-desktop";
   if (pathname.startsWith("/personalization/")) return "personalization";
@@ -150,6 +163,13 @@ export const routeConfigs: RouteConfig[] = [
   { path: "/chat/:agentId/:threadId", element: null, useWrapper: true },
 
   // Common
+  { path: "/pm", element: <PMPage /> },
+  { path: "/pm/decisions", element: <PMDecisionCenterPage /> },
+  {
+    path: "/pm/requirements/:requirementId",
+    element: <PMRequirementDetailPage />,
+  },
+  { path: "/pm/tasks/:taskId", element: <PMTaskWorkspacePage /> },
   { path: "/experts", element: <ExpertsPage /> },
   { path: "/tasks", element: <CronJobsPage /> },
   { path: "/connectors", element: <ConnectorsPage /> },

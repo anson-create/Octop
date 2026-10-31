@@ -34,6 +34,7 @@ import { mbtiApi } from "./modules/mbti";
 import { terminalAiApi } from "./modules/terminalAi";
 import { ssoApi } from "./modules/sso";
 import { knowledgeBasesApi } from "./modules/knowledgeBases";
+import { pmApi } from "./modules/pm";
 
 export const api = {
   // Root
@@ -87,6 +88,9 @@ export const api = {
 
   // Terminal AI
   ...terminalAiApi,
+
+  // PM workspace (需求方案)
+  ...pmApi,
 };
 
 export default api;

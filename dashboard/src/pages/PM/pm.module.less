@@ -1,0 +1,756 @@
+/* PM workspace (需求方案) — layout only; every colour comes from the theme vars. */
+
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  height: 100%;
+}
+
+/* ---- health strip ---------------------------------------------------- */
+
+.health {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border: 1px solid var(--fn-border-secondary);
+  border-radius: 8px;
+  background: var(--fn-bg-secondary);
+  font-size: 12px;
+  color: var(--fn-text-secondary);
+}
+
+.healthTitle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: var(--fn-text-primary);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #16a34a;
+  flex: 0 0 auto;
+}
+
+.dotWarn {
+  background: #f59e0b;
+}
+
+.dotError {
+  background: #ef4444;
+}
+
+.healthSpacer {
+  flex: 1;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.toolbarSpacer {
+  flex: 1;
+}
+
+/* ---- three-column workspace ------------------------------------------ */
+
+.grid {
+  display: grid;
+  /* chain | chat + decisions | artifacts. The right column gets the extra
+     fraction because a prototype preview needs width; the chat column can
+     live with less. */
+  grid-template-columns: 268px minmax(0, 1fr) minmax(0, 1.15fr);
+  gap: 12px;
+  flex: 1;
+  min-height: 0;
+}
+
+.gridNarrow {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.col {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  border: 1px solid var(--fn-border-secondary);
+  border-radius: 10px;
+  background: var(--fn-bg-container);
+  overflow: hidden;
+}
+
+.colHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--fn-border-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fn-text-primary);
+  flex: 0 0 auto;
+}
+
+.colBody {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px 12px;
+}
+
+.mobileCols {
+  margin-bottom: 8px;
+}
+
+/* ---- middle column: decision zone above, chat below ------------------- */
+
+.colBodySplit {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: hidden;
+}
+
+/* Capped so the chat keeps a usable height; the cards scroll on their own. */
+.decideZone {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 auto;
+  min-height: 0;
+  max-height: 46%;
+  padding-bottom: 8px;
+  border-bottom: 1px dashed var(--fn-border-secondary);
+}
+
+.decideZone[data-empty="true"] {
+  max-height: none;
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+/* Collapsed on mobile: header only, no divider, no reserved height. */
+.decideZone[data-collapsed="true"] {
+  max-height: none;
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+.zoneHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  padding-bottom: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fn-text-secondary);
+}
+
+/* Mobile only: the zone header becomes the collapse handle, so the chat is
+   not squeezed by cards the user is not answering right now. */
+.zoneToggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  font: inherit;
+  font-weight: 600;
+  color: inherit;
+  cursor: pointer;
+}
+
+.zoneToggle:focus-visible {
+  outline: 2px solid var(--fn-border-focus);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.zoneCount {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 9px;
+  background: var(--fn-bg-warning-light);
+  color: #b45309;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.zoneScroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
+  /* Fallback cap: if the parent height ever resolves as indefinite the
+     percentage above degenerates to ``none``, so bound it to the viewport. */
+  max-height: 42vh;
+}
+
+.zoneEmpty {
+  font-size: 12px;
+  color: var(--fn-text-tertiary);
+}
+
+/* Footnote-style guidance that only earns its height on a desktop. */
+.desktopOnly {
+  display: block;
+}
+
+/* ---- stage rail ------------------------------------------------------ */
+
+.stageGroup {
+  margin-bottom: 12px;
+}
+
+.stageTitle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--fn-text-tertiary);
+  margin-bottom: 4px;
+}
+
+.stepRow {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+.stepRow:hover,
+.stepRow:focus-visible {
+  background: var(--fn-bg-hover);
+  outline: none;
+}
+
+.stepRowActive {
+  border-color: var(--fn-border-input);
+  background: var(--fn-bg-active);
+}
+
+.stepDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-top: 5px;
+  flex: 0 0 auto;
+  background: var(--fn-text-quaternary);
+}
+
+.stepDot[data-status="passed"] {
+  background: #16a34a;
+}
+
+.stepDot[data-status="failed"] {
+  background: #ef4444;
+}
+
+.stepDot[data-status="running"] {
+  background: var(--fn-text-brand);
+}
+
+.stepDot[data-status="waiting_card"] {
+  background: #f59e0b;
+}
+
+.stepDot[data-status="skipped"] {
+  background: var(--fn-text-tertiary);
+}
+
+.stepName {
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--fn-text-primary);
+}
+
+.stepMeta {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--fn-text-tertiary);
+}
+
+.progressBar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--fn-bg-tertiary);
+  overflow: hidden;
+  margin: 6px 0 10px;
+}
+
+.progressFill {
+  height: 100%;
+  background: var(--fn-text-brand);
+  transition: width 0.3s ease;
+}
+
+.stageChips {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.stageChip {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  border: 1px solid var(--fn-border-secondary);
+  color: var(--fn-text-tertiary);
+  background: var(--fn-bg-secondary);
+}
+
+.stageChip[data-state="passed"] {
+  color: #15803d;
+  border-color: var(--fn-border-success);
+  background: var(--fn-bg-success-light);
+}
+
+.stageChip[data-state="running"] {
+  color: var(--fn-text-brand);
+  border-color: var(--fn-border-focus);
+  background: var(--fn-bg-active);
+}
+
+.stageChip[data-state="waiting_human"] {
+  color: #b45309;
+  border-color: #fcd34d;
+  background: var(--fn-bg-warning-light);
+}
+
+.stageChip[data-state="failed"] {
+  color: var(--fn-text-danger);
+  border-color: #fca5a5;
+  background: var(--fn-bg-danger-light);
+}
+
+/* ---- artifacts / conclusions ---------------------------------------- */
+
+.markdown {
+  font-size: 13px;
+  line-height: 1.7;
+  min-height: 180px;
+}
+
+.artifactMeta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+  font-size: 11.5px;
+  color: var(--fn-text-tertiary);
+  margin-bottom: 8px;
+}
+
+.conclusion {
+  padding: 8px 0;
+  border-bottom: 1px dashed var(--fn-border-secondary);
+}
+
+.conclusion:last-child {
+  border-bottom: none;
+}
+
+.conclusionText {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--fn-text-primary);
+}
+
+.conclusionMeta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--fn-text-tertiary);
+}
+
+.evidenceChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  border: 1px solid var(--fn-border-secondary);
+  background: var(--fn-bg-secondary);
+  font-size: 11px;
+  color: var(--fn-text-secondary);
+  cursor: pointer;
+  font-family: var(--fn-font-mono);
+}
+
+.evidenceChip:hover {
+  border-color: var(--fn-border-input);
+  color: var(--fn-text-primary);
+}
+
+.sectionTitle {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fn-text-secondary);
+  margin: 14px 0 6px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+/* ---- decisions ------------------------------------------------------- */
+
+.decisionCard {
+  border: 1px solid var(--fn-border-secondary);
+  border-radius: 8px;
+  padding: 10px;
+  margin-bottom: 10px;
+  background: var(--fn-bg-elevated);
+}
+
+.decisionCard[data-level="L3"] {
+  border-left: 3px solid #ef4444;
+}
+
+.decisionCard[data-level="L2"] {
+  border-left: 3px solid #f59e0b;
+}
+
+.decisionCard[data-level="L1"] {
+  border-left: 3px solid var(--fn-border-strong);
+}
+
+.decisionHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+  font-size: 11px;
+  color: var(--fn-text-tertiary);
+}
+
+.decisionQuestion {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.5;
+  color: var(--fn-text-primary);
+  margin-bottom: 8px;
+}
+
+.option {
+  border: 1px solid var(--fn-border-secondary);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  cursor: pointer;
+  background: var(--fn-bg-container);
+}
+
+.option:hover {
+  border-color: var(--fn-border-input);
+}
+
+.optionActive {
+  border-color: var(--fn-text-brand);
+  background: var(--fn-bg-selected);
+}
+
+.optionHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fn-text-primary);
+}
+
+.optionMeta {
+  margin-top: 4px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--fn-text-secondary);
+}
+
+.optionMetaRow {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--fn-text-tertiary);
+}
+
+.emptyHint {
+  padding: 24px 8px;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--fn-text-tertiary);
+}
+
+/* ---- evidence drawer ------------------------------------------------- */
+
+.evidenceBlock {
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr);
+  gap: 6px 10px;
+  margin-bottom: 12px;
+  font-size: 12px;
+}
+
+.kvKey {
+  color: var(--fn-text-tertiary);
+}
+
+.kvValue {
+  color: var(--fn-text-primary);
+  word-break: break-word;
+}
+
+.excerpt {
+  margin: 0;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--fn-border-secondary);
+  background: var(--fn-bg-code);
+  font-family: var(--fn-font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.warnText {
+  color: #b45309;
+  font-size: 11.5px;
+}
+
+.dangerText {
+  color: var(--fn-text-danger);
+  font-size: 11.5px;
+}
+
+.traceJson {
+  font-family: var(--fn-font-mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--fn-bg-code);
+  border-radius: 8px;
+  padding: 10px;
+  max-height: 260px;
+  overflow: auto;
+}
+
+/* ---- collab chat (drives the shared Chat runtime, not a second one) --- */
+
+.chatPanel {
+  display: flex;
+  flex-direction: column;
+  min-height: 420px;
+}
+
+.chatHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fn-text-secondary);
+  padding-bottom: 6px;
+}
+
+/* The exact context line that gets prepended — visible, never hidden. */
+.chatContext {
+  font-family: var(--fn-font-mono);
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--fn-text-tertiary);
+  background: var(--fn-bg-code);
+  border-radius: 6px;
+  padding: 4px 8px;
+  margin-bottom: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chatBody {
+  flex: 1;
+  min-height: 240px;
+  max-height: 54vh;
+  overflow: auto;
+}
+
+.chatBlank {
+  padding: 24px 8px;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--fn-text-tertiary);
+}
+
+.chatBlankHint {
+  margin-top: 6px;
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+.chatError {
+  padding: 16px 8px;
+  font-size: 12px;
+  color: var(--fn-text-danger);
+}
+
+.chatComposer {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  margin-top: 8px;
+  border: 1px solid var(--fn-border-secondary);
+  border-radius: 10px;
+  padding: 6px 8px;
+  background: var(--fn-bg-container);
+}
+
+.chatComposer:focus-within {
+  border-color: var(--fn-border-focus);
+}
+
+.chatTextarea {
+  flex: 1;
+  border: none;
+  outline: none;
+  resize: none;
+  background: transparent;
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--fn-text-primary);
+  max-height: 120px;
+}
+
+.chatSend {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--fn-text-inverse, #fff);
+  background: var(--fn-text-brand);
+}
+
+.chatSend:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+/* Inside the split middle column the panel shares height with the decision
+   zone, so it drops the standalone floor and lets the message list scroll. */
+.chatPanelFill {
+  flex: 1;
+  min-height: 0;
+}
+
+.chatBodyFill {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+}
+
+/* ---- prototype html preview ------------------------------------------ */
+
+.htmlPreview {
+  width: 100%;
+  min-height: 420px;
+  border: 1px solid var(--fn-border-secondary);
+  border-radius: 8px;
+  background: #fff;
+}
+
+@media (max-width: 767px) {
+  .grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .colBody {
+    padding: 8px 10px;
+  }
+
+  /* Keep the split split. Letting the strip scroll here buries the composer
+     under the message list — the one thing that must stay reachable. */
+  .colBodySplit {
+    overflow: hidden;
+  }
+
+  /* Cards get a slightly larger share but still yield to the chat; the
+     header collapses them entirely when the user is not answering. */
+  .decideZone {
+    max-height: 52%;
+  }
+
+  .zoneScroll {
+    max-height: none;
+  }
+
+  .chatPanelFill {
+    min-height: 0;
+  }
+
+  /* Six metrics on a phone wrap to three lines and eat the workspace;
+     one scrollable line keeps them reachable without spending height. */
+  .health {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+  }
+
+  .health > span {
+    white-space: nowrap;
+  }
+
+  /* The status tag and the "待拍板 N" badge already say this; the banner
+     would take a fifth of a phone's workspace to repeat it. */
+  .desktopOnly {
+    display: none;
+  }
+}

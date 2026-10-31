@@ -155,6 +155,9 @@ class ErrorCode(StrEnum):
     TEAM_MEMBER_BUSY = "TEAM_MEMBER_BUSY"
     TEAM_NOT_SHAREABLE = "TEAM_NOT_SHAREABLE"
     LOCAL_DOWNLOAD_UNAVAILABLE = "LOCAL_DOWNLOAD_UNAVAILABLE"
+    # PM workspace (需求方案工作台) — 409 for state conflicts, 400 for input rules.
+    PM_CONFLICT = "PM_CONFLICT"
+    PM_VALIDATION = "PM_VALIDATION"
 
 
 _DEFAULT_STATUS: dict[ErrorCode, int] = {
@@ -304,6 +307,8 @@ _DEFAULT_STATUS: dict[ErrorCode, int] = {
     ErrorCode.TEAM_MEMBER_BUSY: 409,
     ErrorCode.TEAM_NOT_SHAREABLE: 400,
     ErrorCode.LOCAL_DOWNLOAD_UNAVAILABLE: 403,
+    ErrorCode.PM_CONFLICT: 409,
+    ErrorCode.PM_VALIDATION: 400,
 }
 
 

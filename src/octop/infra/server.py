@@ -332,6 +332,8 @@ class OctopServer:
         self._ldap_service: LdapAuthService | None = None
         self._ldap_bind_throttle: LdapBindThrottle | None = None
         self._ldap_bind_throttle_services: SharedServices | None = None
+        # PM 需求方案工作台 service (None until the control-plane DB is bound).
+        self.pm_service: Any | None = None
 
     # Backward compat: expose user_manager directly
     @property
@@ -444,6 +446,7 @@ class OctopServer:
 
         db = open_database(config, self.paths)
         run_migrations(db)
+        self._start_pm(db)
         self.services = build_shared_services(db=db, paths=self.paths, config=config)
         from octop.infra.auth.captcha import boot_from_services  # noqa: PLC0415
 
@@ -453,6 +456,29 @@ class OctopServer:
         self._started = True
         assert self.user_manager is not None
         self._emit_wizard_password(user_count=self.user_manager.count())
+
+    def _start_pm(self, db: Any) -> None:
+        """Apply PM migrations and build the PM service (fail-soft).
+
+        A PM defect must never keep Octop from booting: on failure the service
+        stays unset, and ``GET /api/pm/health`` reports the broken migration
+        instead of the workspace silently half-working.
+        """
+        from octop.infra.db.repos.audit import AuditRepo  # noqa: PLC0415
+        from octop.infra.pm.migrate import run_pm_migrations  # noqa: PLC0415
+        from octop.infra.pm.service import PMService  # noqa: PLC0415
+
+        try:
+            run_pm_migrations(db)
+        except Exception:
+            logger.exception("PM migrations failed; PM workspace will be unavailable")
+            self.pm_service = None
+            return
+        try:
+            self.pm_service = PMService(db, audit=AuditRepo(db))
+        except Exception:
+            logger.exception("PM service initialisation failed")
+            self.pm_service = None
 
     async def bind_control_plane(self) -> None:
         """Open the configured control-plane DB and boot runtime (first-run wizard).
@@ -471,6 +497,7 @@ class OctopServer:
         except Exception:
             db.close()
             raise
+        self._start_pm(db)
         self.services = build_shared_services(db=db, paths=self.paths, config=config)
         from octop.infra.auth.captcha import boot_from_services  # noqa: PLC0415
 
