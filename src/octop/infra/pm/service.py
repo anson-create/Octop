@@ -701,6 +701,39 @@ class PMService:
     def _jira_token_key(self, workspace_id: int) -> str:
         return f"pm.jira.token.{workspace_id}"
 
+    def _jira_credential_key(self, workspace_id: int) -> str:
+        return f"pm.jira.credential.{workspace_id}"
+
+    def _jira_credential(self, workspace_id: int) -> tuple[str, str]:
+        """``(username, token)`` as stored, both in the secret store.
+
+        Two kinds of instance exist in the wild: ones that issue a PAT (sent as
+        a bearer token, no username needed) and ones that only hand out an
+        account password (sent as Basic, username required). Which one applies
+        is a property of the instance, so the account name is kept next to the
+        password instead of in the integration mapping — one secret, one shape.
+
+        Falls back to the legacy token-only key, so an instance configured
+        before this change keeps working without re-entering anything.
+        """
+
+        raw = self._jira_secrets().get(self._jira_credential_key(workspace_id))
+        if raw:
+            try:
+                data = loads(raw.decode("utf-8"), None)
+            except UnicodeDecodeError:
+                data = None
+            if isinstance(data, dict):
+                return (
+                    str(data.get("username") or "").strip(),
+                    str(data.get("token") or "").strip(),
+                )
+        legacy = self._jira_secrets().get(self._jira_token_key(workspace_id))
+        return "", legacy.decode("utf-8").strip() if legacy else ""
+
+    def _jira_token(self, workspace_id: int) -> str:
+        return self._jira_credential(workspace_id)[1]
+
     def _jira_secrets(self) -> Any:
         if self._secrets is None:
             from octop.infra.db.repos.secrets import SecretRepo  # noqa: PLC0415
@@ -714,20 +747,18 @@ class PMService:
             return {}
         return loads(item.mapping_json, {}) or {}
 
-    def _jira_token(self, workspace_id: int) -> str:
-        raw = self._jira_secrets().get(self._jira_token_key(workspace_id))
-        return raw.decode("utf-8").strip() if raw else ""
-
     def jira_status(self, workspace_id: int) -> dict[str, Any]:
         """What the picker needs to know before it tries to list anything."""
         mapping = self._jira_mapping(workspace_id)
         item = self._repos.integrations.get_by_vendor(workspace_id, "jira")
+        username, token = self._jira_credential(workspace_id)
         return {
-            "configured": bool(mapping.get("base_url") and self._jira_token(workspace_id)),
+            "configured": bool(mapping.get("base_url") and token),
             "base_url": str(mapping.get("base_url") or ""),
             "jql": str(mapping.get("jql") or ""),
             "verify_tls": bool(mapping.get("verify_tls", True)),
-            "token_set": bool(self._jira_token(workspace_id)),
+            "token_set": bool(token),
+            "auth": "basic" if username else "bearer",
             "enabled": bool(item.enabled) if item is not None else False,
             "last_probe_at": getattr(item, "last_probe_at", None) if item is not None else None,
             "probe_status": getattr(item, "probe_status", None) if item is not None else None,
@@ -739,12 +770,16 @@ class PMService:
         *,
         base_url: str,
         token: str | None = None,
+        username: str | None = None,
         jql: str | None = None,
         verify_tls: bool = True,
     ) -> dict[str, Any]:
-        """Persist the endpoint in the integration row and the PAT in the secret store.
+        """Persist the endpoint in the integration row and the credential in the secret store.
 
-        Splitting them is the whole point: a database dump stays harmless.
+        Splitting them is the whole point: a database dump stays harmless. The
+        account name travels with the password rather than in the mapping,
+        because the two are one credential — an instance either wants both or
+        neither, and a username without its password is not config, it is noise.
         """
         if self._repos.workspaces.get(workspace_id) is None:
             raise errors.not_found("workspace", workspace_id)
@@ -760,17 +795,25 @@ class PMService:
         if jql is not None:
             mapping["jql"] = jql.strip()
 
-        key = self._jira_token_key(workspace_id)
+        stored_user, stored_token = self._jira_credential(workspace_id)
+        new_user = stored_user if username is None else username.strip()
+        new_token = stored_token if token is None or not token.strip() else token.strip()
+
+        key = self._jira_credential_key(workspace_id)
         secrets = self._jira_secrets()
-        if token is not None and token.strip():
-            value = token.strip().encode("utf-8")
+        if new_user or new_token:
+            value = dumps({"username": new_user, "token": new_token}).encode("utf-8")
+
+            def _seed(payload: bytes = value) -> bytes:
+                return payload
+
             if secrets.get(key) is None:
-                secrets.get_or_create(key, lambda: value)
+                secrets.get_or_create(key, _seed)
                 # get_or_create races are fine; make sure the value we were handed
                 # actually landed rather than a stale one.
                 if secrets.get(key) != value:
                     secrets.rotate(key, value)
-            else:
+            elif secrets.get(key) != value:
                 secrets.rotate(key, value)
 
         self._repos.integrations.upsert(
@@ -993,7 +1036,7 @@ class PMService:
 
         mapping = self._jira_mapping(workspace_id)
         base_url = str(mapping.get("base_url") or "")
-        token = self._jira_token(workspace_id)
+        username, token = self._jira_credential(workspace_id)
         if not base_url:
             raise PortUnavailable("Jira 未配置：请先在设置里填写站点地址与 token")
         if not token:
@@ -1001,6 +1044,7 @@ class PMService:
         return JiraClient(
             base_url,
             token,
+            username=username,
             verify_tls=bool(mapping.get("verify_tls", True)),
         )
 

@@ -9,6 +9,8 @@ evidence table.
 
 from __future__ import annotations
 
+import base64
+
 import httpx
 import pytest
 
@@ -167,6 +169,42 @@ def test_query_is_quoted_so_it_cannot_rewrite_the_jql() -> None:
 
     assert '\\"' in captured["jql"]
     assert captured["jql"].count('"') % 2 == 0
+
+
+def test_a_username_switches_the_client_to_basic_auth() -> None:
+    """Instances that issue a password instead of a PAT have no bearer token.
+
+    A bearer header against such an instance is a 401 that reads like a bad
+    password, so the presence of a username has to change the auth scheme.
+    """
+
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["auth"] = request.headers.get("authorization", "")
+        return httpx.Response(200, json={"name": "anson", "displayName": "熊培"})
+
+    with JiraClient(
+        "http://jira.example.com", "pw-secret", username=" anson ", transport=httpx.MockTransport(handler)
+    ) as client:
+        assert client.myself()["name"] == "anson"
+
+    assert seen["auth"].startswith("Basic ")
+    decoded = base64.b64decode(seen["auth"].removeprefix("Basic ")).decode()
+    assert decoded == "anson:pw-secret"
+
+
+def test_without_a_username_the_token_stays_a_bearer() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["auth"] = request.headers.get("authorization", "")
+        return httpx.Response(200, json={"name": "bot"})
+
+    with JiraClient("https://jira.example.com", "pat-token", transport=httpx.MockTransport(handler)) as client:
+        client.myself()
+
+    assert seen["auth"] == "Bearer pat-token"
 
 
 def test_components_are_read_from_the_project_they_belong_to() -> None:

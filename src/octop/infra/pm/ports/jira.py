@@ -12,6 +12,7 @@ second connection-pool lifecycle to get wrong.
 
 from __future__ import annotations
 
+import base64
 from typing import Any
 from urllib.parse import quote
 
@@ -298,6 +299,7 @@ class JiraClient:
         base_url: str,
         token: str,
         *,
+        username: str = "",
         timeout: float = 15.0,
         verify_tls: bool = True,
         transport: httpx.BaseTransport | None = None,
@@ -308,14 +310,24 @@ class JiraClient:
         if not token:
             raise PortUnavailable("Jira token is not configured")
         self.base_url = cleaned
+        self.username = (username or "").strip()
+        use_basic = bool(self.username)
+        # A personal access token is sent as a bearer token. An instance that
+        # hands out an account password instead has no PAT at all, and a bearer
+        # header against it is a guaranteed 401 — verified against a real DC
+        # install, where Bearer failed and Basic succeeded for the same account.
+        # So username present means Basic; absent means PAT.
+        if use_basic:
+            raw = f"{self.username}:{token}".encode()
+            auth_header = "Basic " + base64.b64encode(raw).decode()
+        else:
+            auth_header = f"Bearer {token}"
         self._client = httpx.Client(
             base_url=cleaned,
             timeout=timeout,
             verify=verify_tls,
             headers={
-                # Server/DC PATs are bearer tokens; Basic auth is Cloud-only and
-                # would fail here with a 401 that looks like a bad password.
-                "Authorization": f"Bearer {token}",
+                "Authorization": auth_header,
                 "Accept": "application/json",
             },
             transport=transport,

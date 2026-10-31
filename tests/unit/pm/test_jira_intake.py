@@ -7,6 +7,8 @@ lands in the database.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from octop.infra.pm import errors
@@ -93,10 +95,12 @@ def test_token_is_stored_outside_the_database_row(service, workspace, db) -> Non
     mapping_json = str(rows[0]["mapping_json"])
     credential_ref = str(rows[0]["credential_ref"])
     assert "super-secret-pat" not in mapping_json
-    assert credential_ref.startswith("pm.jira.token.")
+    assert credential_ref.startswith("pm.jira.credential.")
 
     stored = {row["k"]: bytes(row["v"]).decode("utf-8") for row in secrets}
-    assert stored[credential_ref] == "super-secret-pat"
+    # The stored value is one JSON credential (account name + password), so the
+    # token is a field inside it rather than the whole value.
+    assert json.loads(stored[credential_ref])["token"] == "super-secret-pat"
 
     # And the read API never echoes it back.
     status = service.jira_status(workspace["id"])

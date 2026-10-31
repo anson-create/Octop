@@ -84,6 +84,7 @@ async def jira_config(
         workspace_id,
         base_url=body.base_url,
         token=body.token,
+        username=body.username,
         jql=body.jql,
         verify_tls=body.verify_tls,
     )

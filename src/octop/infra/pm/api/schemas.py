@@ -52,6 +52,10 @@ class JiraConfig(BaseModel):
     base_url: str = Field(min_length=1, max_length=300)
     # Write-only. Never echoed back — jira_status reports token_set instead.
     token: str | None = None
+    # Required only for instances that authenticate with an account password
+    # (Basic) instead of a personal access token (Bearer). Send it and the
+    # client switches to Basic; leave it out and the token is sent as a bearer.
+    username: str | None = None
     jql: str | None = None
     verify_tls: bool = True
 
