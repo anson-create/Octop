@@ -98,9 +98,16 @@ _SSR_PLANS: dict[str, SsrPlan] = {
         ),
         # Pinned by the renderer to match the mirror: vue-server-renderer and
         # vue-template-compiler must be the same major.minor as the app's vue,
-        # otherwise Vue refuses to render at all.
+        # otherwise Vue refuses to render at all. The compiler is listed
+        # explicitly because npm's automatic peer install would pick the latest
+        # 2.x (2.7) and mismatch this app's 2.6.
         toolchain="vue2",
-        toolchain_requirements=("vite", "vite-plugin-vue2", "vue-server-renderer"),
+        toolchain_requirements=(
+            "vite",
+            "vite-plugin-vue2",
+            "vue-server-renderer",
+            "vue-template-compiler",
+        ),
     ),
 }
 
