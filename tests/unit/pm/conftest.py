@@ -65,6 +65,19 @@ _FAKE_ISSUES = {
         "project": "CARGO",
         "resolution": "",
         "labels": ["报关"],
+        # The functional area, as picked in Jira. Intake must carry this into the
+        # evidence snapshot: it is the strongest hint about which page to derive.
+        "components": ["报关单管理"],
+        "custom_fields": [
+            {"id": "customfield_10101", "name": "业务痛点", "text": "关务每天手工录入 200 票"},
+        ],
+        "comments": [
+            {"author": "产品经理", "text": "这个在报关单列表页加个导入按钮", "created": ""},
+        ],
+        "attachments": [
+            {"filename": "报关单列表-导入入口.png", "mime": "image/png", "size": "2048"},
+        ],
+        "environment": "",
         "created": "2026-10-01T09:00:00.000+0800",
         "updated": "2026-10-30T18:00:00.000+0800",
     },
@@ -112,14 +125,21 @@ class FakeJiraClient:
     def myself(self) -> dict:
         return {"displayName": "测试员", "name": "tester"}
 
-    def issue(self, key: str) -> dict:
+    def issue(self, key: str, *, with_context: bool = False) -> dict:
         from octop.infra.pm.ports.jira import JiraError
 
         self.calls.append(("issue", key))
         item = self.issues.get((key or "").strip().upper())
         if item is None:
             raise JiraError("Jira 返回 404：issue 不存在或地址不对")
-        return dict(item)
+        payload = dict(item)
+        if with_context:
+            # The real client asks Jira for these only at intake; the fake has to
+            # answer with the same keys or intake silently loses its page hints.
+            for name in ("components", "custom_fields", "comments", "attachments"):
+                payload.setdefault(name, [])
+            payload.setdefault("environment", "")
+        return payload
 
     def search(self, jql: str, *, limit: int = 20) -> list[dict]:
         self.calls.append(("search", jql))

@@ -1080,7 +1080,11 @@ class PMService:
 
         try:
             with self.jira_client(workspace_id) as client:
-                issue = client.issue(key)
+                # Intake is the only moment the ticket is in hand, and locating
+                # the screen later needs fields the picker never shows —
+                # components, attachments, comments, and whichever custom field
+                # this instance happens to call "痛点". Fetch them once here.
+                issue = client.issue(key, with_context=True)
         except PortError as exc:
             raise errors.invalid(str(exc)) from exc
 
@@ -1098,6 +1102,14 @@ class PMService:
         # permanently un-exportable. The key lives in source_ref and baseline,
         # which are metadata and never rendered into the deliverable.
         raw_text = description
+
+        # Snapshot of everything the ticket says about *where* this lives. Kept
+        # out of raw_text on purpose: comments are conversation, not requirement
+        # text, and mixing them in would change what every downstream document
+        # claims the customer asked for.
+        from octop.infra.pm.domain.locate_evidence import LocateEvidence  # noqa: PLC0415
+
+        evidence = LocateEvidence.from_issue(issue)
 
         return self.create_requirement(
             workspace_id=workspace_id,
@@ -1118,6 +1130,13 @@ class PMService:
                 "jira_priority": issue.get("priority"),
                 "jira_assignee": issue.get("assignee"),
                 "jira_updated": issue.get("updated"),
+                "jira_components": list(issue.get("components") or []),
+                "jira_labels": list(issue.get("labels") or []),
+                "jira_custom_fields": [
+                    {"name": item.get("name"), "text": str(item.get("text") or "")[:400]}
+                    for item in (issue.get("custom_fields") or [])
+                ],
+                "locate_evidence": evidence.as_dict(),
             },
             client_token=client_token,
             actor=actor,

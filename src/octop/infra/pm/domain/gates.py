@@ -47,6 +47,9 @@ class GateContext:
     requirement_items: Sequence[Mapping[str, Any]] = ()
     conclusions: Sequence[Mapping[str, Any]] = ()
     prototype_html: str | None = None
+    # "source" means the markup came out of the product's own page; "ai" means
+    # a model drew it. Only the former may claim exact fidelity.
+    prototype_origin: str | None = None
     fidelity: str | None = None
     fidelity_note: str | None = None
     decision: Mapping[str, Any] | None = None
@@ -304,6 +307,28 @@ def _p4_no_fabrication(ctx: GateContext) -> tuple[bool, str, dict[str, Any]]:
         "total": len(ctx.conclusions),
         "uncovered": sum(1 for item in ctx.conclusions if item.get("status") == "uncovered"),
     }
+
+
+@gate("P4", "G-P4-05", steps=("prototype",))
+def _p4_exact_requires_source(ctx: GateContext) -> tuple[bool, str, dict[str, Any]]:
+    """``exact`` is reserved for markup that came out of the product's own page.
+
+    A model that has never seen the product cannot produce a 1:1 result, so a
+    model-drawn prototype claiming exact fidelity is a false statement about the
+    artifact rather than a quality problem. Catching it here means the claim has
+    to be backed by the derivation path, which records the page and the class
+    overlap it measured.
+    """
+
+    origin = str(ctx.prototype_origin or "")
+    fidelity = str(ctx.fidelity or "")
+    if fidelity == "exact" and origin != "source":
+        return (
+            False,
+            "exact fidelity requires a prototype derived from product source",
+            {"origin": origin or "(unset)", "fidelity": fidelity},
+        )
+    return True, "", {"origin": origin or "(unset)", "fidelity": fidelity}
 
 
 # --- P5 review and delivery -------------------------------------------------

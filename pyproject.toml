@@ -114,6 +114,9 @@ include = [
     "src/octop/infra/agents/subagents/library/**/*",
     "src/octop/infra/agents/subagents/divisions.json",
     "src/octop/infra/control/desktop/scripts/**/*",
+    # The Vue SSR renderer must ship with the wheel: without it the prototype
+    # step can only draw a page instead of deriving one.
+    "src/octop/infra/pm/runtime/assets/**/*",
 ]
 artifacts = [
     "src/octop/dashboard/**/*",

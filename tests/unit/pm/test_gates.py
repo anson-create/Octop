@@ -50,6 +50,7 @@ POSITIVE = {
     "G-P4-02": _ctx(step_key="prototype", prototype_html="<html><form><table></table></form></html>", fidelity="exact", conclusions=({"status": "uncovered"},)),
     "G-P4-03": _ctx(step_key="prototype", prototype_html="<html></html>", fidelity="partial", fidelity_note="列表未做分页", conclusions=({"status": "uncovered"},)),
     "G-P4-04": _ctx(step_key="prd", conclusions=({"seq": 1, "status": "evidenced", "evidence_ids": [1]}, {"seq": 2, "status": "uncovered"})),
+    "G-P4-05": _ctx(step_key="prototype", prototype_origin="source", fidelity="exact", conclusions=({"status": "uncovered"},)),
     "G-P5-01": _ctx(step_key="review", reviews={"business": "pass", "tech": "pass", "customer": "pass"}),
     "G-P5-02": _ctx(step_key="deliver", external_write=True, external_write_signed=True),
 }
@@ -66,6 +67,7 @@ NEGATIVE = {
     "G-P4-02": _ctx(step_key="prototype", prototype_html="<html><html>", fidelity="exact", conclusions=({"status": "uncovered"},)),
     "G-P4-03": _ctx(step_key="prototype", prototype_html="<html></html>", fidelity=None, conclusions=({"status": "uncovered"},)),
     "G-P4-04": _ctx(step_key="prd", conclusions=({"seq": 1, "status": "evidenced", "evidence_ids": []},)),
+    "G-P4-05": _ctx(step_key="prototype", prototype_origin="ai", fidelity="exact", conclusions=({"status": "uncovered"},)),
     "G-P5-01": _ctx(step_key="review", reviews={"business": "pass"}),
     "G-P5-02": _ctx(step_key="deliver", external_write=True, external_write_signed=False),
 }

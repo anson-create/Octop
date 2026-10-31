@@ -26,11 +26,13 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+from octop.infra.pm.domain.repos import REPOS
 from octop.infra.pm.runtime.executor import (
     ExecutorUnavailable,
     StepContext,
     StepOutput,
 )
+from octop.infra.pm.runtime.prototype_derive import DerivationOutcome, derive_from_source
 
 MODEL_STEPS: tuple[str, ...] = (
     "link_expand",
@@ -245,12 +247,18 @@ class ModelStepExecutor:
         model: str | None = None,
         timeout_s: float = 120.0,
         repair_attempts: int = 1,
+        prototype_source: Callable[[dict[str, Any], str], DerivationOutcome] | None = None,
+        ssr_timeout_s: int = 240,
     ) -> None:
         self._models_provider = models_provider
         self._repos = repos
         self._model = model
         self._timeout_s = timeout_s
         self._repair_attempts = max(0, repair_attempts)
+        # Injected in tests so the prototype step can be exercised without a
+        # node runtime. ``None`` means "use the real deriver".
+        self._prototype_source = prototype_source
+        self._ssr_timeout_s = ssr_timeout_s
 
     # --- port ---------------------------------------------------------------
 
@@ -750,7 +758,185 @@ class ModelStepExecutor:
     # --- P4: production -----------------------------------------------------
 
     def _prototype(self, ctx: StepContext) -> StepOutput:
+        """Derive the page from the product's source; only then consider drawing.
+
+        The order is the whole point. A model-written page cannot be 1:1 with a
+        product it has never seen, so derivation is attempted first and a model
+        draft is the *fallback*, explicitly labelled as such. The fidelity note
+        always names which of the two happened and, when derivation failed, why.
+        """
+
         analysis = self._latest_document(ctx)
+        source = dict(ctx.source_repo or {})
+        # The ticket's own fields are the query. The analysis draft is *not*:
+        # it is prose the model wrote about the plan, and its vocabulary pulls
+        # the locator toward whatever the plan talks about rather than toward
+        # the screen. It only stands in when the ticket carries nothing.
+        locate = getattr(ctx, "locate_evidence", None)
+        query = f"{ctx.requirement_title}\n{ctx.requirement_text}"
+        outcome = self._derive_prototype(source, query, locate)
+        if outcome is not None and outcome.ok and outcome.prototype is not None:
+            return self._derived_prototype(ctx, outcome)
+        return self._invented_prototype(ctx, analysis, source, outcome)
+
+    def _derive_prototype(
+        self, source: dict[str, Any], query: str, evidence: Any = None
+    ) -> DerivationOutcome | None:
+        """Run the source deriver, or report why there is none.
+
+        ``None`` means "no deriver is configured" — a different fact from
+        "derivation was attempted and failed", and the two produce different
+        fidelity notes.
+        """
+
+        if self._prototype_source is not None:
+            try:
+                return self._prototype_source(source, query, evidence)
+            except Exception as exc:  # noqa: BLE001 - 派生异常要变成可读的 note
+                return DerivationOutcome(ok=False, reason=f"源码派生异常：{exc}")
+
+        spec = REPOS.get(str(source.get("web_repo") or ""))
+        if spec is None:
+            return DerivationOutcome(
+                ok=False, reason=str(source.get("reason") or "需求未映射到源码仓库")
+            )
+        return derive_from_source(
+            spec, query, evidence=evidence, timeout_s=self._ssr_timeout_s
+        )
+
+    def _derived_prototype(self, ctx: StepContext, outcome: DerivationOutcome) -> StepOutput:
+        """The prototype came from the real page — say so with measurements."""
+
+        prototype = outcome.prototype
+        if prototype is None:  # pragma: no cover - the caller checks this
+            raise ExecutorUnavailable("derivation reported ok without a prototype")
+        location = outcome.location
+        page = prototype.source_page.lstrip("/")
+        evidence = [
+            _envelope(
+                source_type="human",
+                locator=_pm_record("requirement", ctx.task_public_id),
+                excerpt=_clip(f"原型依据需求 {ctx.task_public_id}：{ctx.requirement_text}"),
+                confidence=0.6,
+            ),
+            _envelope(
+                source_type="code",
+                # A real file we actually rendered, not a plausible-looking path.
+                locator={
+                    "kind": "code_span",
+                    "repo": prototype.repo_key,
+                    "path": page,
+                    "lines": "",
+                },
+                excerpt=(
+                    f"{prototype.repo_key}@{prototype.git_ref or 'HEAD'} 的 {page} 经 Vue SSR 渲染："
+                    f"class 同源率 {prototype.class_overlap:.0%}"
+                    f"（{prototype.classes_source} 个源 class），"
+                    f"内联 {prototype.styles_inlined} 份样式"
+                ),
+                confidence=0.95 if not location.ambiguous else 0.6,
+            ),
+        ]
+
+        gaps: list[str] = []
+        # Fidelity is the render's own verdict, but an ambiguous page caps it: a
+        # perfect render of "a" page is not a 1:1 prototype of *this requirement*
+        # when the locator could not tell which page it was.
+        fidelity = prototype.fidelity
+        if location.ambiguous and fidelity == "exact":
+            fidelity = "partial"
+        conclusions: list[dict[str, Any]] = [
+            {
+                "text": (
+                    f"原型由 {prototype.repo_key} 的 {page} 渲染派生，"
+                    f"class 同源率 {prototype.class_overlap:.0%}，"
+                    f"样式来自产品自身构建（{prototype.styles_inlined} 份）。"
+                ),
+                "status": "evidenced",
+                "evidence_indexes": [1],
+            },
+            {
+                "text": (
+                    f"页面定位方式：{location.method}，检索词 "
+                    f"{'、'.join(location.terms[:5]) or '(无)'}。"
+                ),
+                "status": "evidenced",
+                "evidence_indexes": [1],
+            },
+            {
+                "text": "SSR 时无网络、不执行 onMounted，页面渲染为空态；业务文案可替换，结构不可改。",
+                "status": "undetermined",
+            },
+        ]
+        if location.ambiguous:
+            shortlist = "、".join(item.source_file for item in location.candidates[:3])
+            gaps.append(
+                f"页面定位不唯一，当前取 {page}；其他候选：{shortlist}。选错页则整稿作废，需人工指定"
+            )
+            conclusions.append(
+                {
+                    "text": f"页面定位不唯一（候选 {len(location.candidates)} 个），本稿可能对应另一页面。",
+                    "status": "uncovered",
+                }
+            )
+        if prototype.errors:
+            gaps.append(f"渲染期告警 {len(prototype.errors)} 条：{prototype.errors[0][:160]}")
+
+        note = prototype.fidelity_note
+        if location.ambiguous:
+            note += " 注意：页面候选不唯一，本稿可能对应的是另一个页面。"
+
+        return StepOutput(
+            status="passed",
+            artifact={
+                "kind": "prototype_html",
+                "title": "交互原型",
+                "audience": "internal",
+                "fidelity": fidelity,
+                "fidelity_note": note,
+                "origin": "source",
+                "body": prototype.html,
+                "source_repo": {
+                    "project": str(dict(ctx.source_repo or {}).get("project") or ""),
+                    "mapped": True,
+                    "web_repo": prototype.repo_key,
+                    "system": str(dict(ctx.source_repo or {}).get("system") or ""),
+                    "derived": True,
+                    "page": page,
+                    "git_ref": prototype.git_ref,
+                    "class_overlap": round(prototype.class_overlap, 3),
+                    "classes_source": prototype.classes_source,
+                    "page_ambiguous": location.ambiguous,
+                },
+            },
+            conclusions=conclusions,
+            evidence=evidence,
+            gaps=gaps,
+            trace={
+                "sources": ["requirement", "pm_analysis", "code"],
+                "tool_calls": ["graph.locate", "vue.ssr"],
+                "kinds": [tag for tag in _ELEMENT_TAGS if tag in prototype.html.lower()],
+                "html_len": len(prototype.html),
+                "source_repo": dict(ctx.source_repo or {}),
+                "derivation": outcome.as_dict(),
+            },
+        )
+
+    def _invented_prototype(
+        self,
+        ctx: StepContext,
+        analysis: str,
+        source: dict[str, Any],
+        outcome: DerivationOutcome | None,
+    ) -> StepOutput:
+        """Fallback: a model-drawn page, labelled as not derived.
+
+        This exists so a requirement never stalls on a missing mirror or an
+        unbuilt graph. It is never presented as the product's own screen: the
+        fidelity is ``partial`` and the note names the exact reason derivation
+        did not happen.
+        """
+
         raw = self._ask(
             system=(
                 _BASE_SYSTEM
@@ -783,17 +969,21 @@ class ModelStepExecutor:
                 confidence=0.6,
             )
         ]
-        source = dict(ctx.source_repo or {})
-        # Say which repository this prototype *should* have come from. Without
-        # this the artifact looks equally credible whether it was derived from the
-        # product's source or invented, which is the confusion we are removing.
-        if source.get("mapped"):
-            source_note = (
-                f"应源自 {source.get('web_repo')}（{source.get('system')}），"
-                f"镜像{'已就绪' if source.get('mirror_ready') else '未同步'}"
-            )
+        if outcome is None:
+            reason = "服务未接入源码派生器"
+        elif outcome.reason:
+            reason = outcome.reason
+        elif source.get("mapped"):
+            reason = "源码派生未产出结果"
         else:
-            source_note = f"未能定位源码仓库：{source.get('reason') or '需求未关联 Jira 项目'}"
+            reason = str(source.get("reason") or "需求未关联 Jira 项目")
+        if source.get("mapped"):
+            # Keep the mirror state in the note: "not synced" and "synced but
+            # the page would not render" send a reviewer to different fixes.
+            reason = (
+                f"{reason}（应源自 {source.get('web_repo')}，"
+                f"镜像{'已就绪' if source.get('mirror_ready') else '未同步'}）"
+            )
 
         return StepOutput(
             status="passed",
@@ -804,7 +994,7 @@ class ModelStepExecutor:
                 "fidelity": "partial",
                 "fidelity_note": (
                     "模型生成的设计稿，静态假数据，未接真实接口，未经设计评审；"
-                    f"且未从源码派生——{source_note}。"
+                    f"且未从源码派生——{reason}。"
                 ),
                 "origin": "ai",
                 "body": html,
@@ -814,6 +1004,7 @@ class ModelStepExecutor:
                     "web_repo": source.get("web_repo", ""),
                     "system": source.get("system", ""),
                     "derived": False,
+                    "derive_failed_reason": reason,
                 },
             },
             conclusions=[
@@ -823,16 +1014,17 @@ class ModelStepExecutor:
                     "evidence_indexes": [0],
                 },
                 {"text": "原型为静态假数据，交互行为未联通后端。", "status": "undetermined"},
-                {"text": f"原型未从源码派生，{source_note}。", "status": "undetermined"},
+                {"text": f"原型未从源码派生，{reason}。", "status": "undetermined"},
             ],
             evidence=evidence,
-            gaps=["原型未经设计评审，交互细节需 UI 确认"],
+            gaps=[f"原型未从源码派生：{reason}", "原型未经设计评审，交互细节需 UI 确认"],
             trace={
                 "sources": ["requirement", "pm_analysis"],
                 "tool_calls": ["model.prototype"],
                 "kinds": kinds,
                 "html_len": len(html),
                 "source_repo": source,
+                "derivation": outcome.as_dict() if outcome is not None else None,
             },
         )
 

@@ -119,6 +119,16 @@ scripts/lh_image_install_octop_tencentos.sh
 
 # Test scratch dir created by the runner
 .pytest-tmp/
+.pytest-tmp*/
+.build-tmp/
+
+# Deploy helper: host keys pinned per machine, never shared
+.deploy_hostkey
 
 # Code-graph output (regenerable, ~7 MB per repo)
 graphify-out/
+
+# Scratch dirs/files left behind by the test runner when TMPDIR is unavailable.
+# The random 8-character names are tempfile probe files, not project data.
+.ptb/
+[0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z]

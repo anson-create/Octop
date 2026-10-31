@@ -29,6 +29,88 @@ ISSUE_FIELDS = (
     "issuetype,project,created,updated,resolution"
 )
 
+# Fields that say *which part of the product* an issue is about. `components`
+# is the only structural one — it is literally a functional-area picker in the
+# Jira UI — so it is fetched even though the picker list does not show it.
+LOCATE_FIELDS = "components,environment,attachment,comment"
+
+# Names (Chinese and English) that mark a custom field as carrying functional
+# context. Matched as substrings against the field's display name, because a
+# "痛点" that a team writes today is `customfield_10231` tomorrow.
+_LOCATE_NAME_HINTS = (
+    "模块",
+    "功能",
+    "页面",
+    "菜单",
+    "系统",
+    "板块",
+    "业务",
+    "产品",
+    "痛点",
+    "问题",
+    "背景",
+    "现状",
+    "场景",
+    "建议",
+    "方案",
+    "期望",
+    "目标",
+    "需求",
+    "流程",
+    "影响",
+    "范围",
+    "说明",
+    "描述",
+    "module",
+    "feature",
+    "page",
+    "menu",
+    "screen",
+    "pain",
+    "problem",
+    "background",
+    "context",
+    "scenario",
+    "proposal",
+    "solution",
+    "suggestion",
+    "expect",
+    "goal",
+    "scope",
+    "story",
+    "requirement",
+)
+
+# Name fragments that mean the field is bookkeeping, not product context. A
+# field called "需求优先级" would otherwise match 需求 above.
+_LOCATE_NAME_VETO = (
+    "优先级",
+    "状态",
+    "经办人",
+    "报告人",
+    "创建",
+    "更新",
+    "截止",
+    "工时",
+    "工作量",
+    "估算",
+    "编号",
+    "版本号",
+    "priority",
+    "status",
+    "assignee",
+    "reporter",
+    "created",
+    "updated",
+    "due",
+    "estimate",
+    "sprint",
+    "rank",
+    "vote",
+    "watch",
+    "resolution",
+)
+
 DEFAULT_JQL = (
     "assignee = currentUser() AND resolution = Unresolved "
     "ORDER BY updated DESC"
@@ -71,8 +153,58 @@ def _flatten_adf(node: dict[str, Any], out: list[str]) -> None:
         out.append("\n")
 
 
-def issue_to_summary(raw: dict[str, Any]) -> dict[str, Any]:
-    """Normalise one Jira issue into the shape the picker and intake want."""
+def _looks_like_prose(schema: dict[str, Any]) -> bool:
+    """Is this custom field free text a human typed?
+
+    Deliberately narrow: dates, numbers, selects and user pickers cannot carry
+    a feature name, and asking for them only bloats the payload.
+    """
+
+    kind = str(schema.get("type") or "").lower()
+    if kind in ("string", "text"):
+        return True
+    # ADF documents (Jira Cloud renders "paragraph" rich text) come back as
+    # objects; ``any`` is the schema type Cloud uses for rich text fields.
+    return kind in ("any", "doc")
+
+
+def locate_field_ids(catalog: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Pick the custom fields worth reading when locating a page in source.
+
+    Returns ``[{"id", "name"}]``. This is intentionally permissive on *which*
+    fields it reads and strict on *nothing* downstream: what comes back is
+    treated as one weighted signal among several, never as an answer on its own.
+    """
+
+    picked: list[dict[str, str]] = []
+    for item in catalog:
+        if not isinstance(item, dict):
+            continue
+        field_id = str(item.get("id") or "")
+        name = _clean_text(item.get("name"))
+        if not field_id.startswith("customfield_") or not name:
+            continue
+        name_lc = name.lower()
+        if any(veto in name_lc for veto in _LOCATE_NAME_VETO):
+            continue
+        if not any(hint in name_lc for hint in _LOCATE_NAME_HINTS):
+            continue
+        schema = item.get("schema") or {}
+        if not _looks_like_prose(schema):
+            continue
+        picked.append({"id": field_id, "name": name})
+    return picked
+
+
+def issue_to_summary(
+    raw: dict[str, Any], *, custom_names: dict[str, str] | None = None
+) -> dict[str, Any]:
+    """Normalise one Jira issue into the shape the picker and intake want.
+
+    ``custom_names`` maps ``customfield_10999`` to its display name. Without it
+    the custom values are dropped: an unnamed field would reach the model as an
+    opaque key, and the model would treat the key itself as content.
+    """
     fields = raw.get("fields") or {}
     status = fields.get("status") or {}
     assignee = fields.get("assignee") or {}
@@ -80,7 +212,56 @@ def issue_to_summary(raw: dict[str, Any]) -> dict[str, Any]:
     issue_type = fields.get("issuetype") or {}
     project = fields.get("project") or {}
     resolution = fields.get("resolution") or {}
-    labels = fields.get("labels") or []
+
+    labels = [str(item) for item in (fields.get("labels") or []) if isinstance(item, str)]
+    components = [
+        _clean_text((item or {}).get("name"))
+        for item in (fields.get("components") or [])
+        if isinstance(item, dict)
+    ]
+
+    custom: list[dict[str, str]] = []
+    for field_id, display in (custom_names or {}).items():
+        value = fields.get(field_id)
+        if value is None:
+            continue
+        text = _clean_text(value)
+        if not text:
+            continue
+        custom.append({"id": field_id, "name": display, "text": text})
+
+    comments: list[dict[str, str]] = []
+    comment_block = fields.get("comment") or {}
+    if isinstance(comment_block, dict):
+        for item in comment_block.get("comments") or []:
+            if not isinstance(item, dict):
+                continue
+            body = _clean_text(item.get("body"))
+            if not body:
+                continue
+            comments.append(
+                {
+                    "author": _clean_text((item.get("author") or {}).get("displayName")),
+                    "text": body,
+                    "created": _clean_text(item.get("created")),
+                }
+            )
+
+    attachments: list[dict[str, str]] = []
+    for item in fields.get("attachment") or []:
+        if not isinstance(item, dict):
+            continue
+        filename = _clean_text(item.get("filename"))
+        if not filename:
+            continue
+        attachments.append(
+            {
+                "filename": filename,
+                "mime": _clean_text(item.get("mimeType")),
+                "size": str(item.get("size") or ""),
+            }
+        )
+
     return {
         "key": str(raw.get("key") or ""),
         "title": _clean_text(fields.get("summary")) or str(raw.get("key") or ""),
@@ -93,7 +274,12 @@ def issue_to_summary(raw: dict[str, Any]) -> dict[str, Any]:
         "issue_type": _clean_text(issue_type.get("name")),
         "project": _clean_text(project.get("key")),
         "resolution": _clean_text(resolution.get("name")),
-        "labels": [str(item) for item in labels if isinstance(item, str)],
+        "labels": labels,
+        "components": [item for item in components if item],
+        "environment": _clean_text(fields.get("environment")),
+        "custom_fields": custom,
+        "comments": comments,
+        "attachments": attachments,
         "created": _clean_text(fields.get("created")),
         "updated": _clean_text(fields.get("updated")),
     }
@@ -134,6 +320,9 @@ class JiraClient:
             transport=transport,
             follow_redirects=True,
         )
+        # Field catalog is instance-wide and changes rarely; one fetch per
+        # client beats re-asking on every intake.
+        self._locate_fields: list[dict[str, str]] | None = None
 
     def close(self) -> None:
         self._client.close()
@@ -230,18 +419,51 @@ class JiraClient:
             raise JiraError("Jira 搜索结果缺少 issues 字段")
         return [issue_to_summary(item) for item in issues if isinstance(item, dict)]
 
-    def issue(self, key: str) -> dict[str, Any]:
+    def locate_fields(self) -> list[dict[str, str]]:
+        """Custom fields on this instance that can name a functional area.
+
+        Cached per client. A failure here is not fatal for intake: the issue is
+        still readable, it just gets fewer signals, and the caller says so.
+        """
+
+        if self._locate_fields is not None:
+            return self._locate_fields
+        try:
+            payload = self._request("GET", "/rest/api/2/field")
+        except PortError:
+            self._locate_fields = []
+            return []
+        catalog = payload if isinstance(payload, list) else []
+        self._locate_fields = locate_field_ids(catalog)
+        return self._locate_fields
+
+    def issue(self, key: str, *, with_context: bool = False) -> dict[str, Any]:
+        """Fetch one issue.
+
+        ``with_context`` additionally pulls components, environment, attachments,
+        comments and the locate-relevant custom fields. It costs one extra call
+        (the field catalog) and a larger payload, so the picker list does not
+        use it — only intake does, where "which page is this about" matters.
+        """
+
         cleaned = (key or "").strip()
         if not cleaned:
             raise PortError("issue key is empty")
+        fields = ISSUE_FIELDS
+        custom_names: dict[str, str] = {}
+        if with_context:
+            located = self.locate_fields()
+            custom_names = {item["id"]: item["name"] for item in located}
+            extra = list(LOCATE_FIELDS.split(",")) + list(custom_names)
+            fields = ",".join([ISSUE_FIELDS, *extra])
         payload = self._request(
             "GET",
             f"/rest/api/2/issue/{cleaned}",
-            params={"fields": ISSUE_FIELDS},
+            params={"fields": fields},
         )
         if not isinstance(payload, dict):
             raise JiraError("Jira issue 响应格式不对")
-        return issue_to_summary(payload)
+        return issue_to_summary(payload, custom_names=custom_names)
 
     def probe(self) -> dict[str, Any]:
         """Cheap reachability check: who am I, and how many issues do I see."""

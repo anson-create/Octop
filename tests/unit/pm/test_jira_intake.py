@@ -118,3 +118,43 @@ def test_bare_issue_key_uses_a_key_lookup_not_text_search(
 
     assert _looks_like_issue_key("CCTOWER-3597") is True
     assert _looks_like_issue_key("供应商 就绪") is False
+
+
+def test_intake_snapshots_every_field_that_can_name_the_screen(
+    service, workspace, fake_jira
+) -> None:
+    """Title and description are not the only places a ticket says *where*.
+
+    The component picker, the custom "痛点" field, a comment and the name of an
+    attached screenshot each name a functional area. Intake is the only moment
+    they are in hand, so they are snapshotted here rather than re-fetched later.
+    """
+
+    requirement = service.create_requirement_from_jira(
+        workspace["id"], issue_key="CARGO-1234"
+    )
+    baseline = requirement["baseline"]
+    evidence = baseline["locate_evidence"]
+
+    assert baseline["jira_components"] == ["报关单管理"]
+    assert baseline["jira_custom_fields"][0]["name"] == "业务痛点"
+
+    kinds = {item["kind"] for item in evidence["sources"]}
+    assert {"component", "summary", "description", "custom", "comment", "attachment"} <= kinds
+    # Ranked, so the first entry is the one worth trusting most.
+    assert evidence["sources"][0]["kind"] == "component"
+    assert evidence["sources"][0]["text"] == "报关单管理"
+
+
+def test_the_screenshot_name_is_used_but_its_contents_are_not_claimed(
+    service, workspace, fake_jira
+) -> None:
+    requirement = service.create_requirement_from_jira(
+        workspace["id"], issue_key="CARGO-1234"
+    )
+    evidence = requirement["baseline"]["locate_evidence"]
+
+    attachment = [item for item in evidence["sources"] if item["kind"] == "attachment"]
+    assert attachment and "报关单列表" in attachment[0]["text"]
+    # No OCR was run, and nothing may imply otherwise.
+    assert all("识别" not in item["text"] for item in evidence["sources"])

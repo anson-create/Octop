@@ -1,0 +1,595 @@
+"""Whole pipeline for "derive this requirement's prototype from real source".
+
+Three questions have to be answered in order, and each one can fail honestly:
+
+1. **Which repository?** Answered before this module is called, from the Jira
+   project code (``domain.repos``). A wrong answer here produces a prototype that
+   is faithful to the wrong product, so it is never guessed.
+2. **Which page in it?** ``locate_page`` — Chinese requirement text reaches the
+   code's identifiers through the product's own i18n catalogue, then the
+   tree-sitter graph maps identifiers to files.
+3. **Can it be rendered?** ``derive_from_source`` — the repo's own Vite config
+   plus Vue SSR, via ``assets/render.mjs``.
+
+Every failure returns a reason a human can act on ("mirror not synced", "no code
+graph", "no i18n match", "SSR crashed") instead of an empty string, because the
+prototype step prints that reason into the artifact's fidelity note. A prototype
+that could not be derived must say so; that is the whole point of the step.
+
+Indexes are cached per repository and invalidated by the index file's
+mtime+size, so a requirement costs one graph scan rather than one per step, and
+rebuilding the graph does not require a service restart.
+"""
+
+from __future__ import annotations
+
+import re
+import threading
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from octop.infra.pm.domain.locate_evidence import LocateEvidence
+from octop.infra.pm.domain.repos import RepoSpec
+from octop.infra.pm.ports.graph import GraphHit, GraphIndex
+from octop.infra.pm.ports.i18n import I18nIndex
+from octop.infra.pm.runtime.prototype_source import (
+    DerivedPrototype,
+    PrototypeDeriver,
+    SsrRenderer,
+)
+
+# The renderer ships inside the wheel so `pip install` alone enables derivation.
+# It cannot run from there: `import 'vite'` resolves against the *script's*
+# directory, and site-packages has no node_modules. It is therefore copied into
+# the mirror root, which is the one file this service ever writes there —
+# source trees are read-only.
+RENDER_SCRIPT_NAME = "render.mjs"
+_ASSET_DIR = Path(__file__).parent / "assets"
+
+# A page-level hit beats a component hit, but a component is still a legitimate
+# answer (some products put the whole screen in one). Only files we can actually
+# render are candidates.
+_MIN_TERM_LEN = 3
+
+# Files a browser can render into a prototype — the same set the graph port
+# treats as derivable.
+_RENDERABLE_SUFFIXES = (".vue", ".tsx", ".jsx", ".svelte")
+
+# English identifiers embedded in Chinese tickets ("加个 vendorCode 校验").
+_IDENTIFIER_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,40}")
+
+# Two candidates this close together means "we cannot tell which page". The
+# caller must then treat the pick as a hypothesis, not a fact.
+_AMBIGUITY_RATIO = 1.2
+
+
+@dataclass(frozen=True)
+class PageCandidate:
+    source_file: str
+    score: float
+    matched_labels: tuple[str, ...] = ()
+    reasons: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "source_file": self.source_file,
+            "score": round(self.score, 3),
+            "matched_labels": list(self.matched_labels),
+            "reasons": list(self.reasons),
+        }
+
+
+@dataclass
+class PageLocation:
+    """The answer to "which page", plus how sure we are and why."""
+
+    candidates: tuple[PageCandidate, ...] = ()
+    terms: tuple[str, ...] = ()
+    method: str = "none"  # i18n+graph | graph | none
+    notes: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.candidates)
+
+    @property
+    def page(self) -> str:
+        return self.candidates[0].source_file if self.candidates else ""
+
+    @property
+    def ambiguous(self) -> bool:
+        """True when the runner-up is close enough that the pick is a guess."""
+
+        if len(self.candidates) < 2:
+            return False
+        top, second = self.candidates[0].score, self.candidates[1].score
+        if top <= 0:
+            return True
+        return second > 0 and top / second < _AMBIGUITY_RATIO
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "page": self.page,
+            "method": self.method,
+            "ambiguous": self.ambiguous,
+            "terms": list(self.terms),
+            "candidates": [item.as_dict() for item in self.candidates[:3]],
+            "notes": list(self.notes),
+        }
+
+
+@dataclass
+class DerivationOutcome:
+    """What the prototype step gets back: a page, or a reason there is none."""
+
+    ok: bool
+    prototype: DerivedPrototype | None = None
+    location: PageLocation = field(default_factory=PageLocation)
+    reason: str = ""
+
+    @property
+    def page(self) -> str:
+        if self.prototype is not None:
+            return self.prototype.source_page
+        return self.location.page
+
+    @property
+    def class_overlap(self) -> float:
+        return self.prototype.class_overlap if self.prototype is not None else 0.0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "reason": self.reason,
+            "page": self.page,
+            "location": self.location.as_dict(),
+            "class_overlap": round(self.class_overlap, 3),
+            "derived": bool(self.prototype is not None and self.prototype.derived),
+        }
+
+
+# --- indexes ----------------------------------------------------------------
+
+_CACHE: dict[str, tuple[tuple[int, int], Any]] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def _fingerprint(path: Path) -> tuple[int, int]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return (0, 0)
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _cached(key: str, path: Path, build: Any) -> Any:
+    stamp = _fingerprint(path)
+    with _CACHE_LOCK:
+        hit = _CACHE.get(key)
+        if hit is not None and hit[0] == stamp:
+            return hit[1]
+    value = build()
+    with _CACHE_LOCK:
+        _CACHE[key] = (stamp, value)
+    return value
+
+
+def graph_index(root: Path) -> GraphIndex | None:
+    """The repo's code graph, or ``None`` when it was never built."""
+
+    path = GraphIndex.graph_path(Path(root))
+    return _cached(
+        f"graph::{root}", path, lambda: GraphIndex.load(Path(root))
+    )
+
+
+def i18n_index(root: Path) -> I18nIndex | None:
+    """The repo's Chinese catalogue, or ``None`` when it has none.
+
+    Keyed on the root directory's mtime: a catalogue edit inside an existing
+    file does not change it, so the service is restarted (or the graph rebuilt)
+    to pick that up. Cheaper than stat-ing every catalogue file on every step,
+    and the failure mode is stale search terms rather than wrong ones.
+    """
+
+    path = Path(root)
+    return _cached(f"i18n::{root}", path, lambda: I18nIndex.load(path))
+
+
+def clear_cache() -> None:
+    """Drop every cached index — used by tests and by a manual resync."""
+
+    with _CACHE_LOCK:
+        _CACHE.clear()
+
+
+# --- renderer placement -----------------------------------------------------
+
+
+def ensure_render_script(root: Path) -> Path | None:
+    """Copy the packaged renderer into ``root`` if it is missing or stale.
+
+    Returns the path to run, or ``None`` when the asset is not in the wheel
+    (a source checkout that skipped the build, for instance).
+    """
+
+    asset = _ASSET_DIR / RENDER_SCRIPT_NAME
+    if not asset.is_file():
+        return None
+    try:
+        payload = asset.read_bytes()
+    except OSError:
+        return None
+
+    target = Path(root) / RENDER_SCRIPT_NAME
+    if target.is_file():
+        try:
+            if target.read_bytes() == payload:
+                return target
+        except OSError:
+            # Unreadable copy: fall through and try to overwrite it.
+            pass
+    try:
+        target.write_bytes(payload)
+    except OSError:
+        # A read-only mirror that already carries a renderer still works — it
+        # may just be an older one. Say so by returning it rather than failing.
+        return target if target.is_file() else None
+    return target
+
+
+# --- locating ---------------------------------------------------------------
+
+
+def _identifiers(text: str, limit: int = 8) -> list[str]:
+    """English identifiers written directly into the ticket."""
+
+    found: list[str] = []
+    for match in _IDENTIFIER_RE.finditer(text or ""):
+        token = match.group(0)
+        if len(token) < _MIN_TERM_LEN or token in found:
+            continue
+        found.append(token)
+        if len(found) >= limit:
+            break
+    return found
+
+
+_PAGE_DIRS = ("/views/", "/pages/", "/screens/")
+# Directories that hold a page-shaped file which is not a screen: tests, build
+# output, and the " 2" duplicates an iCloud-synced checkout leaves behind.
+_SKIP_MARKERS = ("/__tests__/", "/node_modules/", "/dist/", "/.git/")
+_SKIP_PATTERN = re.compile(r" \d+/")
+
+
+def _is_page(path: str) -> bool:
+    """Whether a file is a screen we could render, rather than a module."""
+
+    if not path.endswith(_RENDERABLE_SUFFIXES):
+        return False
+    lowered = f"/{path.lower()}"
+    if any(marker in lowered for marker in _SKIP_MARKERS):
+        return False
+    if _SKIP_PATTERN.search(path):
+        return False
+    return any(hint in lowered for hint in _PAGE_DIRS)
+
+
+def _page_candidates(hits: list[GraphHit], limit: int) -> tuple[PageCandidate, ...]:
+    """Hits that are already pages *and* carry a strong signal.
+
+    Weak hits are files that merely contain a common word; treating them as
+    answers is how a supplier requirement once landed on the zip-code page.
+    """
+
+    return tuple(
+        PageCandidate(
+            source_file=hit.source_file,
+            score=hit.score,
+            matched_labels=hit.matched_labels,
+            reasons=hit.reasons,
+        )
+        for hit in hits
+        if _is_page(hit.source_file) and hit.strong
+    )[:limit]
+
+
+def _climb_to_pages(
+    graph: GraphIndex, hits: list[GraphHit], terms: list[str], limit: int
+) -> tuple[tuple[PageCandidate, ...], str]:
+    """Follow one import hop up from module hits to the pages that use them.
+
+    A page is only accepted when its own path carries one of the search terms.
+    Without that check "some page imports this enum" would be read as "this is
+    the screen" — e.g. a supplier requirement landing on the app-access page
+    because both import a shared status enum. That failure is worse than no
+    answer, because the rendered screen looks right and is about something else.
+
+    The score is discounted because the evidence was gathered on the module, not
+    on the screen: the page inherits the association, not the certainty.
+    """
+
+    wanted = [term.lower() for term in terms if term]
+    best: dict[str, float] = {}
+    via: dict[str, str] = {}
+    for hit in hits[:6]:
+        if _is_page(hit.source_file):
+            continue
+        for importer in graph.importers(hit.source_file, max_files=8):
+            if not _is_page(importer):
+                continue
+            if wanted and not any(term in importer.lower() for term in wanted):
+                continue
+            score = hit.score * 0.6
+            if score > best.get(importer, 0.0):
+                best[importer] = score
+                via[importer] = hit.source_file
+    ordered = sorted(best.items(), key=lambda item: (-item[1], item[0]))[:limit]
+    candidates = tuple(
+        PageCandidate(
+            source_file=page,
+            score=score,
+            reasons=(f"imports {via[page]}",),
+        )
+        for page, score in ordered
+    )
+    return candidates, (candidates[0].source_file if candidates else "")
+
+
+def _terms_from(
+    catalogue: I18nIndex | None, text: str, notes: list[str], *, tag: str
+) -> list[str]:
+    """i18n keys for one source, plus identifiers typed by hand."""
+
+    terms: list[str] = []
+    if catalogue is not None:
+        terms = [term for term in catalogue.terms(text, limit=8) if len(term) >= _MIN_TERM_LEN]
+    for token in _identifiers(text):
+        if token not in terms:
+            terms.append(token)
+    if not terms:
+        notes.append(f"「{tag}」没有产出可用检索词")
+    return terms
+
+
+# How much a source's hits count relative to the title. A Jira component field
+# names an area on purpose, so it outranks even the title; a comment is someone
+# thinking out loud and must never outrank the ticket itself.
+_SOURCE_FACTOR = {
+    "component": 1.5,
+    "summary": 1.0,
+    "label": 1.0,
+    "attachment": 0.75,
+    "custom": 0.5,
+    "description": 0.5,
+    "environment": 0.4,
+    "comment": 0.3,
+}
+
+
+# Sources that may create a page candidate on their own. They are short and are
+# written to say what the ticket is about; a body or a comment is prose and its
+# words ("优化", "反馈", "确认") bridge into the codebase's vocabulary as noise —
+# a real measurement had a customs ticket land on the menu-settings page purely
+# on words like `operatorAdmin` and `pending` that the description produced.
+_ANCHOR_KINDS = frozenset({"component", "label", "attachment", "summary"})
+
+
+def _hits_from_evidence(
+    graph: GraphIndex,
+    evidence: LocateEvidence,
+    catalogue: I18nIndex | None,
+    *,
+    limit: int,
+    notes: list[str],
+) -> tuple[list[GraphHit], list[str]]:
+    """Search each source separately, then merge.
+
+    Anchoring sources decide *which* pages are candidates; supporting sources
+    can only add weight to a candidate that an anchor already proposed. Without
+    that split, a long description invents candidates of its own and the
+    citation "found in the description" reads as evidence for a wrong page.
+
+    When a ticket has no anchoring source at all (a manually written requirement
+    is often just a title), every source is allowed to propose candidates —
+    otherwise nothing could ever be located.
+    """
+
+    anchors = [item for item in evidence.ranked() if item.kind in _ANCHOR_KINDS]
+    pool = anchors if anchors else list(evidence.ranked())
+
+    all_terms: list[str] = []
+    merged: dict[str, dict[str, Any]] = {}
+    for source, may_create in (
+        [(item, True) for item in pool]
+        + [(item, False) for item in evidence.ranked() if item not in pool]
+    ):
+        factor = _SOURCE_FACTOR.get(source.kind, 0.4)
+        terms = _terms_from(catalogue, source.text, notes, tag=source.field)
+        if not terms:
+            continue
+        for term in terms:
+            if term not in all_terms:
+                all_terms.append(term)
+        hits = graph.search(terms, limit=max(limit * 3, 9))
+        for hit in hits:
+            if not may_create and hit.source_file not in merged:
+                continue
+            entry = merged.setdefault(
+                hit.source_file,
+                {"best": 0.0, "labels": [], "reasons": [], "strong": False, "from": []},
+            )
+            scaled = hit.score * factor
+            entry["best"] = max(entry["best"], scaled)
+            for label in hit.matched_labels:
+                if label not in entry["labels"]:
+                    entry["labels"].append(label)
+            for reason in hit.reasons:
+                if reason not in entry["reasons"]:
+                    entry["reasons"].append(reason)
+            # Only an anchor can vouch for a page's identity. A description that
+            # happens to mention a word must not make a file "strong".
+            entry["strong"] = entry["strong"] or (hit.strong and may_create)
+            if source.field not in entry["from"]:
+                entry["from"].append(source.field)
+
+    if anchors:
+        notes.append(
+            "以"
+            + "、".join(dict.fromkeys(item.field for item in anchors))
+            + "作为锚定依据，其余字段只用于佐证"
+        )
+
+    ordered: list[GraphHit] = []
+    for source_file, entry in merged.items():
+        # Corroboration: a second independent source that also points here is
+        # real evidence, but capped so volume cannot manufacture confidence.
+        extra = min(len(entry["from"]) - 1, 2) * 0.25
+        reasons = [f"命中自{name}" for name in entry["from"][:3]] + entry["reasons"]
+        ordered.append(
+            GraphHit(
+                source_file=source_file,
+                score=entry["best"] * (1.0 + extra),
+                matched_labels=tuple(entry["labels"][:5]),
+                reasons=tuple(dict.fromkeys(reasons))[:5],
+                strong=entry["strong"],
+            )
+        )
+    ordered.sort(key=lambda hit: (-hit.score, hit.source_file))
+    return ordered, all_terms
+
+
+def locate_page(
+    root: Path,
+    text: str,
+    *,
+    evidence: LocateEvidence | None = None,
+    limit: int = 6,
+) -> PageLocation:
+    """Find the source file a requirement is about.
+
+    When ``evidence`` carries the structured ticket fields, each source is
+    searched on its own and weighted. Otherwise the plain ``text`` is treated as
+    one description-level source, which is what a manual requirement has.
+    """
+
+    repo_root = Path(root)
+    graph = graph_index(repo_root)
+    if graph is None:
+        return PageLocation(
+            method="none",
+            notes=("源码仓库还没有代码图谱（graphify-out/graph.json 缺失），无法定位页面",),
+        )
+
+    notes: list[str] = []
+    catalogue = i18n_index(repo_root)
+    if catalogue is None:
+        notes.append("源码仓库没有中文 i18n 词表，只能用文中的英文标识符检索")
+
+    if evidence is not None and evidence.has_content:
+        method = "i18n+graph(多源)" if catalogue is not None else "graph(多源)"
+        hits, terms = _hits_from_evidence(graph, evidence, catalogue, limit=limit, notes=notes)
+        notes.append(
+            f"按 {len(evidence.strong_sources())} 个强信号字段分别检索后合并"
+            f"（来源：{'、'.join(dict.fromkeys(s.field for s in evidence.ranked()[:4]))}）"
+        )
+        if evidence.unread:
+            notes.extend(evidence.unread)
+    else:
+        terms = _terms_from(catalogue, text, notes, tag="需求正文")
+        method = "i18n+graph" if catalogue is not None and terms else "graph"
+        hits = graph.search(terms, limit=max(limit * 3, 9)) if terms else []
+
+    if not terms:
+        return PageLocation(method="none", notes=(*notes, "需求里没有可用于检索的标识符"))
+
+    candidates = _page_candidates(hits, limit)
+    if not candidates:
+        # A requirement's terms land in ``src/api/*.ts`` far more often than in
+        # the .vue file: the API module names every field, the page uses them.
+        # Climbing one import hop recovers the page that renders them.
+        candidates, climbed = _climb_to_pages(graph, hits, terms, limit)
+        if climbed:
+            notes = (*notes, f"检索命中模块文件，沿 import 关系向上定位到页面 {climbed}")
+    if not candidates:
+        weak = [hit for hit in hits if _is_page(hit.source_file)]
+        if weak:
+            shared = "、".join(weak[0].reasons[:2]) or "弱匹配"
+            notes = (
+                *notes,
+                f"命中 {len(weak)} 个页面，但检索词只与其共享通用字段名（{shared}），"
+                "不足以认定是目标页面",
+            )
+        return PageLocation(
+            terms=tuple(terms),
+            method=method,
+            notes=(*notes, f"图谱里没有可渲染的匹配文件（检索词：{'、'.join(terms[:5])}）"),
+        )
+
+    location = PageLocation(candidates=candidates, terms=tuple(terms), method=method, notes=tuple(notes))
+    if location.ambiguous:
+        # Measured on the real mirror: a supplier requirement hit the zip-code
+        # page, then a booking page, then a template list — each by sharing one
+        # generic field name. Picking the winner and saying "may be wrong" still
+        # hands the reviewer a confident, wrong screen, so this refuses instead.
+        shortlist = " | ".join(
+            f"{item.source_file}({item.score:.1f})" for item in candidates[:3]
+        )
+        return PageLocation(
+            method=method,
+            terms=tuple(terms),
+            notes=(
+                f"页面候选不唯一，不自动派生。候选：{shortlist}",
+                "请在需求里指明页面路径，或为该项目补充 Jira 组件字段后再跑",
+                *notes,
+            ),
+        )
+    return location
+
+
+# --- deriving ---------------------------------------------------------------
+
+
+def derive_from_source(
+    spec: RepoSpec,
+    text: str,
+    *,
+    evidence: LocateEvidence | None = None,
+    timeout_s: int = 240,
+    renderer: SsrRenderer | None = None,
+) -> DerivationOutcome:
+    """Locate this requirement's page and render it. Never invents a page."""
+
+    if not spec.renderable:
+        return DerivationOutcome(
+            ok=False,
+            reason=f"{spec.key} 不是前端仓库（{spec.framework}），无法渲染成原型",
+        )
+    root = spec.root()
+    if not root.is_dir():
+        return DerivationOutcome(
+            ok=False, reason=f"源码镜像未同步：{root} 不存在，先跑同步脚本"
+        )
+
+    script = ensure_render_script(root)
+    if script is None:
+        return DerivationOutcome(ok=False, reason="包内缺少 render.mjs，无法执行 SSR 渲染")
+
+    location = locate_page(root, text, evidence=evidence)
+    if not location.ok:
+        return DerivationOutcome(
+            ok=False,
+            location=location,
+            reason=location.notes[0] if location.notes else "未能在源码仓库中定位到对应页面",
+        )
+
+    renderer = renderer or SsrRenderer(script, timeout_s=timeout_s)
+    prototype = PrototypeDeriver(renderer).derive(spec, f"/{location.page}")
+    if not prototype.html:
+        return DerivationOutcome(
+            ok=False,
+            location=location,
+            reason=f"页面 {location.page} 渲染失败：{prototype.fidelity_note}",
+        )
+    return DerivationOutcome(ok=True, prototype=prototype, location=location)

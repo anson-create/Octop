@@ -42,6 +42,11 @@ class StepContext:
     # project code. Empty means "not resolved" — a step that needs source must
     # then say so instead of drawing something plausible.
     source_repo: dict[str, Any] = field(default_factory=dict)
+    # What the ticket said about *which screen* this concerns — components,
+    # labels, attachment names, comments — snapshotted at intake. Kept separate
+    # from requirement_text because the two answer different questions: the text
+    # says what should change, this says where.
+    locate_evidence: Any = None
 
 
 @dataclass

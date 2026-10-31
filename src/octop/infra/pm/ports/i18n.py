@@ -59,6 +59,52 @@ def _bigrams(text: str) -> set[str]:
     return {text[i : i + 2] for i in range(len(text) - 1)}
 
 
+# UI nouns that end a screen's Chinese name. They say what kind of view it is, not
+# which area it belongs to, so they are removed before matching against a
+# catalogue whose own values ("管理", "订单管理") contain the same characters.
+_STRUCTURE_SUFFIXES = (
+    "管理",
+    "列表",
+    "查询",
+    "筛选",
+    "设置",
+    "配置",
+    "维护",
+    "台账",
+    "看板",
+    "报表",
+    "详情",
+    "新增",
+    "编辑",
+    "页面",
+    "模块",
+    "功能",
+    "中心",
+)
+
+# Names longer than this are treated as prose (a title or a description), where
+# stripping a suffix would remove meaning instead of noise.
+_SHORT_NAME_LEN = 10
+
+
+def _strip_structure_suffix(text: str) -> str:
+    """Drop one trailing UI noun so the domain word is what gets matched.
+
+    Returns the input unchanged when nothing useful remains — "管理" on its own
+    carries no area information and must not become an empty query.
+    """
+
+    cjk = _cjk_only(text)
+    for suffix in _STRUCTURE_SUFFIXES:
+        if not cjk.endswith(suffix):
+            continue
+        trimmed = cjk[: -len(suffix)]
+        # Two characters are the shortest domain word worth matching (供应商, 费用).
+        if len(trimmed) >= 2:
+            return trimmed
+    return text
+
+
 @dataclass(frozen=True)
 class I18nEntry:
     key: str
@@ -74,6 +120,10 @@ class I18nEntry:
 class I18nMatch:
     entry: I18nEntry
     score: float
+    # How rare this entry's own wording is. Needed as a tie-breaker: every entry
+    # the requirement fully contains scores 1.0, so without this the ranking fell
+    # back to "longest value first" and `企业` lost its slot to `企业名称`.
+    specificity: float = 0.0
 
     def as_dict(self) -> dict[str, object]:
         return {"score": round(self.score, 3), **self.entry.as_dict()}
@@ -193,19 +243,69 @@ class I18nIndex:
                 score *= 1.15
             # A two-character value is a single bigram: `状态`, `列表`, `原因`
             # all satisfy it, so it must clear a higher bar to be reported.
-            if len(value_cjk) == 2 and not contained:
+            #
+            # Containment does not exempt it. Chinese area names end in these
+            # suffixes almost by grammar — 报关单管理 contains 管理 — and with the
+            # containment bonus `management` scored a full 1.0, tying with the
+            # only correct key (`customs`) and dragging a customs requirement
+            # onto the menu-settings page through `menuManagement`.
+            if len(value_cjk) == 2:
                 score *= 0.55
             if score < threshold:
                 continue
-            matches.append(I18nMatch(entry=entry, score=min(score, 1.0)))
-        matches.sort(key=lambda m: (-m.score, -len(_cjk_only(m.entry.value)), m.entry.key))
+            matches.append(
+                I18nMatch(
+                    entry=entry,
+                    score=min(score, 1.0),
+                    specificity=sum(self._idf(b) for b in have) / max(len(have), 1),
+                )
+            )
+        matches.sort(key=lambda m: (-m.score, -m.specificity, m.entry.key))
         return matches[:limit]
 
-    def terms(self, text: str, *, limit: int = 8) -> list[str]:
-        """The identifiers to hand a graph query, most specific first."""
+    def terms(self, text: str, *, limit: int = 8, relative: float = 0.55) -> list[str]:
+        """The identifiers to hand a graph query, most specific first.
 
+        A short area name is first stripped of its structural suffix. Chinese
+        names for a screen are built as "<domain word><UI noun>" — 报关单管理,
+        供应商列表, 费用查询 — and the UI noun repeats in every sibling name. Left
+        in place, `管理` matches `订单管理` and `菜单管理` by two shared bigrams,
+        outscoring the one entry that actually means "customs". Removing the
+        suffix leaves the domain word, which is the part that identifies the area.
+
+        The stripped pass is a preference, not a replacement: if it finds nothing,
+        the original wording is tried, because plenty of catalogue values are
+        themselves written with the suffix ("权限管理") and only the full name
+        reaches them.
+
+        ``relative`` then drops whatever still scores far below the best match.
+        """
+
+        cjk = _cjk_only(text)
+        if len(cjk) <= _SHORT_NAME_LEN:
+            stripped = _strip_structure_suffix(text)
+            if stripped != text:
+                picked = self._pick_keys(stripped, limit=limit, relative=max(relative, 0.7))
+                if picked:
+                    return picked
+        return self._pick_keys(text, limit=limit, relative=relative)
+
+    def _pick_keys(self, text: str, *, limit: int, relative: float) -> list[str]:
+        matches = self.match(text, limit=limit * 6)
+        if not matches:
+            return []
+        # A short area name admits only near-peers; long text is different — each
+        # clause may legitimately match its own entry — so the ordinary threshold
+        # applies there.
+        floor_ratio = relative if len(_cjk_only(text)) > _SHORT_NAME_LEN else max(relative, 0.7)
+        floor = matches[0].score * floor_ratio
         seen: list[str] = []
-        for match in self.match(text, limit=limit * 3):
+        # The same key usually appears in several modules (`companyName` in five),
+        # so the window has to be wider than the number of keys wanted or the
+        # duplicates consume every slot.
+        for match in matches:
+            if match.score < floor:
+                continue
             key = match.entry.key
             # Single- and two-letter keys (`in`, `to`, `of`) are catalogue
             # plumbing, not search terms; feeding them to a graph query only

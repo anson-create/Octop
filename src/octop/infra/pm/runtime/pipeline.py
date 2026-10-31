@@ -230,6 +230,7 @@ class Pipeline:
             ctx.requirement_title = requirement.title
             ctx.requirement_text = requirement.raw_text
             ctx.source_repo = self._source_repo(requirement)
+            ctx.locate_evidence = self._locate_evidence(requirement)
 
         try:
             output = self._executor.run(ctx)
@@ -346,6 +347,23 @@ class Pipeline:
             "mirror": web.mirror if web is not None else "",
             "mirror_ready": bool(web is not None and web.root().is_dir()),
         }
+
+    def _locate_evidence(self, requirement: Any) -> Any:
+        """Rebuild the ticket's page hints from the intake snapshot.
+
+        Read from ``baseline`` rather than from Jira so a ticket edited after
+        intake cannot move the prototype to a different screen mid-pipeline.
+        """
+
+        from octop.infra.pm.domain.locate_evidence import (  # noqa: PLC0415
+            evidence_from_baseline,
+        )
+
+        baseline = loads(getattr(requirement, "baseline_json", None) or "{}", {}) or {}
+        if not isinstance(baseline, dict):
+            return None
+        evidence = evidence_from_baseline(baseline)
+        return evidence if evidence.has_content else None
 
     def _persist_evidence(self, task_id: int, output: StepOutput) -> list[int]:
         ids: list[int] = []
@@ -492,11 +510,13 @@ class Pipeline:
             trace = {**trace, **output.trace}
 
         prototype_html = None
+        prototype_origin = None
         fidelity = None
         fidelity_note = None
         if artifact is not None:
             if artifact.kind == "prototype_html":
                 prototype_html = artifact.body_inline
+            prototype_origin = getattr(artifact, "origin", None)
             fidelity = artifact.fidelity
             fidelity_note = artifact.fidelity_note
 
@@ -527,6 +547,7 @@ class Pipeline:
             requirement_items=tuple(_requirement_items(artifacts)),
             conclusions=tuple(conclusions),
             prototype_html=prototype_html,
+            prototype_origin=prototype_origin,
             fidelity=fidelity,
             fidelity_note=fidelity_note,
             decision=decision,

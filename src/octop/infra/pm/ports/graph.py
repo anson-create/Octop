@@ -70,6 +70,15 @@ _INDEX_FILES = (
 _EXTENSIONS = ("", ".vue", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".svelte")
 
 
+# `code` inside `zipcode` is a string coincidence, not a signal. A term has to
+# be long enough to be a word before an exact hit on it means anything.
+_STRONG_TERM_MIN_LEN = 5
+# Share of the repo a term may touch and still be allowed to anchor a page.
+# Measured on cwx-platform-admin: `management` reaches roughly this share of the
+# view tree while `permission` reaches two files, so the cutoff separates them.
+_STRONG_SPREAD_RATIO = 0.02
+
+
 @dataclass(frozen=True)
 class GraphHit:
     """One candidate file for a requirement, with the reason it surfaced."""
@@ -78,6 +87,10 @@ class GraphHit:
     score: float
     matched_labels: tuple[str, ...] = ()
     reasons: tuple[str, ...] = ()
+    # A term either names a symbol exactly or appears in the file path. Anything
+    # weaker is "this file mentions some word in common", which is how a supplier
+    # requirement ended up on the zip-code page.
+    strong: bool = False
 
     @property
     def derivable(self) -> bool:
@@ -89,6 +102,7 @@ class GraphHit:
             "score": round(self.score, 3),
             "matched_labels": list(self.matched_labels),
             "reasons": list(self.reasons),
+            "strong": self.strong,
             "derivable": self.derivable,
         }
 
@@ -110,6 +124,7 @@ class GraphIndex:
     edges: list[dict[str, Any]] = field(default_factory=list)
     _by_file: dict[str, list[_Node]] = field(default_factory=dict, repr=False)
     _degree: dict[str, int] = field(default_factory=dict, repr=False)
+    _reverse: dict[str, list[str]] | None = field(default=None, repr=False)
 
     # --- construction -------------------------------------------------------
 
@@ -182,43 +197,88 @@ class GraphIndex:
         if not normalised or not self._by_file:
             return []
 
+        # Pass 1: how many files each term touches. A term that matches a fifth
+        # of the repo ("code", "time", "status") is not evidence of anything, yet
+        # summing every symbol it matches made a 700-symbol file score 166 and
+        # win outright. Rarity is the signal; volume is the noise.
+        spread = dict.fromkeys(normalised, 0)
+        for source_file, nodes in self._by_file.items():
+            file_lc = source_file.lower()
+            labels = [n.label.lower() for n in nodes if _RATIONALE_MARKER not in n.id]
+            for term in normalised:
+                if term in file_lc or any(term in label for label in labels):
+                    spread[term] += 1
+        weight = {
+            term: 1.0 / (1.0 + math.log1p(spread[term])) for term in normalised
+        }
+        # A term that appears in a noticeable share of the repo cannot *anchor* a
+        # page, however exactly it matches. Chinese area names almost always end
+        # in a structural suffix — 管理/列表/查询 — and each maps to one identifier
+        # (`management`, `list`, `query`) that every sibling page also carries. So
+        # "用户权限管理" scored `permission` and `management` alike, every
+        # `*management.vue` tied, and the locator refused a question it had
+        # actually answered correctly. Rarity is what makes a match mean something.
+        rare_enough = max(3, int(self.file_count * _STRONG_SPREAD_RATIO))
+        can_anchor = {term: spread[term] <= rare_enough for term in normalised}
+
+        # Pass 2: one score per (term, file) — the best symbol match, not the
+        # sum over all of them. Otherwise a file with many similarly-named
+        # helpers outranks the file that actually is about the term.
         per_file: dict[str, dict[str, Any]] = {}
         for term in normalised:
+            factor = weight[term]
             for source_file, nodes in self._by_file.items():
                 file_lc = source_file.lower()
+                # `contract-parsing` must answer a query for `contractParsing`:
+                # separators are a spelling difference, not a different word.
+                path_flat = file_lc.replace("-", "").replace("_", "").replace("/", "")
+                best = 0.0
+                best_label = ""
+                best_degree = 0
+                reasons: list[str] = []
+                exact_label = False
                 for node in nodes:
                     if _RATIONALE_MARKER in node.id:
                         continue
                     label_lc = node.label.lower()
                     score = 0.0
-                    hit_reasons: list[str] = []
                     if label_lc == term:
                         score += 10.0
-                        hit_reasons.append(f"label=={term}")
+                        exact_label = True
                     elif term in label_lc:
                         # Prefer the shortest label containing the term: asking
                         # for "supplier" should rank `SupplierTable` above
                         # `SupplierTableColumnConfigDialogHelper`.
                         score += 6.0 * (len(term) / max(len(label_lc), 1))
-                        hit_reasons.append(f"label~{term}")
-                    if term in file_lc:
-                        score += 3.0
-                        hit_reasons.append(f"path~{term}")
-                    if not score:
-                        continue
+                    if score > best:
+                        best, best_label, best_degree = score, node.label, self._degree.get(node.id, 0)
+                in_path = term in file_lc or term in path_flat
+                if in_path:
+                    best += 3.0
+                    reasons.append(f"path~{term}")
+                if best <= 0:
+                    continue
+                if exact_label:
+                    reasons.append(f"label=={term}")
+                elif best_label and not reasons:
+                    reasons.append(f"label~{term}")
+                # A symbol nobody imports is usually dead code or a type alias;
+                # require some connectivity before trusting it.
+                best += min(math.log1p(best_degree), 2.0)
 
-                    # A symbol nobody imports is usually dead code or a type
-                    # alias; require some connectivity before trusting it.
-                    degree = self._degree.get(node.id, 0)
-                    score += min(math.log1p(degree), 2.0)
-
-                    entry = per_file.setdefault(
-                        source_file, {"score": 0.0, "labels": [], "reasons": []}
-                    )
-                    entry["score"] += score
-                    if node.label not in entry["labels"]:
-                        entry["labels"].append(node.label)
-                    entry["reasons"].extend(r for r in hit_reasons if r not in entry["reasons"])
+                entry = per_file.setdefault(
+                    source_file, {"score": 0.0, "labels": [], "reasons": [], "strong": False}
+                )
+                entry["score"] += best * factor
+                if (
+                    len(term) >= _STRONG_TERM_MIN_LEN
+                    and can_anchor[term]
+                    and (exact_label or in_path)
+                ):
+                    entry["strong"] = True
+                if best_label and best_label not in entry["labels"]:
+                    entry["labels"].append(best_label)
+                entry["reasons"].extend(r for r in reasons if r not in entry["reasons"])
 
         hits: list[GraphHit] = []
         for source_file, entry in per_file.items():
@@ -236,6 +296,7 @@ class GraphIndex:
                     score=score,
                     matched_labels=tuple(entry["labels"][:5]),
                     reasons=tuple(entry["reasons"][:5]),
+                    strong=bool(entry["strong"]),
                 )
             )
 
@@ -290,18 +351,35 @@ class GraphIndex:
         return ordered
 
     def importers(self, source_file: str, *, max_files: int = 8) -> list[str]:
-        """Which files import ``source_file`` — used to find a sibling page."""
+        """Which files import ``source_file`` — used to find the page behind a module.
+
+        Backed by a reverse index built in one pass, because the alternative
+        (re-reading every source file per query) made this O(files) per call and
+        the page locator calls it once per candidate.
+        """
 
         target = source_file.lstrip("./")
-        found: list[str] = []
-        for candidate in self.files():
-            if candidate == target:
-                continue
-            if target in self.imports_of(candidate):
-                found.append(candidate)
-                if len(found) >= max_files:
-                    break
-        return found
+        return self.reverse_index().get(target, [])[:max_files]
+
+    def reverse_index(self) -> dict[str, list[str]]:
+        """``imported file -> [importers]``, built once per index instance.
+
+        Reading 700-odd files costs a second or two on first use; the locator
+        then answers "who imports this?" in constant time. Without this a
+        requirement whose terms land in ``src/api/*.ts`` could never reach the
+        page that renders them.
+        """
+
+        if self._reverse is not None:
+            return self._reverse
+        reverse: dict[str, list[str]] = {}
+        for source_file in self._by_file:
+            for imported in self.imports_of(source_file):
+                bucket = reverse.setdefault(imported, [])
+                if source_file not in bucket:
+                    bucket.append(source_file)
+        self._reverse = reverse
+        return reverse
 
     # --- file access --------------------------------------------------------
 
