@@ -321,7 +321,9 @@ class Pipeline:
         if not isinstance(baseline, dict):
             baseline = {}
         project = project_of_requirement(
-            baseline, str(getattr(requirement, "source_ref", "") or "")
+            baseline,
+            str(getattr(requirement, "source_ref", "") or ""),
+            source=str(getattr(requirement, "source", "") or ""),
         )
         if not project:
             return {"project": "", "mapped": False, "reason": "需求没有关联 Jira 项目"}

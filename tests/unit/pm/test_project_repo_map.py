@@ -13,6 +13,7 @@ import pytest
 from octop.infra.pm import errors
 from octop.infra.pm.domain.repos import (
     project_key_of,
+    project_of_requirement,
     resolve_project,
     web_repo_for_project,
 )
@@ -24,6 +25,19 @@ def test_issue_key_reduces_to_its_project() -> None:
     assert project_key_of("cargo-1234") == "CARGO"
     assert project_key_of("CCTOWER-3597") == "CCTOWER"
     assert project_key_of("") == ""
+
+
+def test_non_jira_source_ref_is_not_parsed_as_a_ticket() -> None:
+    """`acceptance/2026-10-31` is a folder, not an issue key.
+
+    Parsing it would yield the project "ACCEPTANCE/2026" and the operator would
+    be told to map a project that does not exist.
+    """
+
+    assert project_of_requirement(None, "acceptance/2026-10-31", source="manual") == ""
+    assert project_of_requirement(None, "CARGO-1234", source="jira") == "CARGO"
+    # A recorded project wins regardless of source.
+    assert project_of_requirement({"jira_project": "CCTOWER"}, "", source="manual") == "CCTOWER"
 
 
 def test_known_project_binds_to_both_layers() -> None:

@@ -222,16 +222,23 @@ def resolve_issue(issue_key: str, overrides: Mapping[str, str] | None = None) ->
 def project_of_requirement(
     baseline: Mapping[str, Any] | None,
     source_ref: str,
+    source: str = "",
 ) -> str:
     """The project a stored requirement belongs to.
 
     Recorded at intake as ``baseline.jira_project``; falls back to the issue key
-    prefix for rows written before that field existed. Never inferred from the
-    requirement's title or text — that would be a keyword guess.
+    prefix only for Jira-sourced rows written before that field existed. A
+    non-Jira ``source_ref`` (``acceptance/2026-10-31``, a spreadsheet id) would
+    otherwise be parsed into a project that never existed. Never inferred from
+    the requirement's title or text — that would be a keyword guess.
     """
 
     recorded = str((baseline or {}).get("jira_project") or "").strip().upper()
-    return recorded or project_key_of(source_ref)
+    if recorded:
+        return recorded
+    if source and source.strip().lower() != "jira":
+        return ""
+    return project_key_of(source_ref)
 
 
 def web_repo_for_project(

@@ -942,7 +942,9 @@ class PMService:
         baseline = baseline if isinstance(baseline, dict) else {}
 
         project = project_of_requirement(
-            baseline, str(getattr(requirement, "source_ref", "") or "")
+            baseline,
+            str(getattr(requirement, "source_ref", "") or ""),
+            source=str(getattr(requirement, "source", "") or ""),
         )
         if not project:
             return {
