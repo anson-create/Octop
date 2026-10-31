@@ -304,6 +304,15 @@ export interface PmHealth {
   decisions_due: number;
 }
 
+/** What is waiting on a human right now — drives the sidebar badge. */
+export interface PmInbox {
+  enabled: boolean;
+  pending: number;
+  overdue: number;
+  by_level: Record<string, number>;
+  next_timeout_at: string | null;
+}
+
 export interface PmMetricRow {
   day: string;
   metric_key: string;

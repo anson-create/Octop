@@ -501,6 +501,14 @@ async def recheck_conclusion(
 # --- internal --------------------------------------------------------------
 
 
+@router.get("/inbox", summary="Cards waiting on me (sidebar badge)")
+async def inbox(
+    pm: PMService = Depends(get_pm),
+    user: Any = Depends(require_permission("pm")),
+) -> dict[str, Any]:
+    return pm.inbox(user_id=int(getattr(user, "id", 0) or 0) or None)
+
+
 @router.post("/internal/sweep", summary="Sweep due cards (scheduler)")
 async def sweep(
     pm: PMService = Depends(get_pm),

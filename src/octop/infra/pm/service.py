@@ -881,6 +881,11 @@ class PMService:
 
     # --- scheduler hook ----------------------------------------------------
 
+    def inbox(self, *, user_id: int | None = None) -> dict[str, Any]:
+        """What is waiting on a human right now. Drives the sidebar badge."""
+        stats = self._repos.decisions.inbox_stats(user_id=user_id)
+        return {"enabled": is_enabled(), **stats}
+
     def sweep(self) -> dict[str, Any]:
         return self._pipeline.sweep_decisions()
 

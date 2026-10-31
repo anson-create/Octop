@@ -252,6 +252,7 @@
   "nav": {
     "chat": "对话",
     "pm": "需求方案",
+    "pmInbox": "{{count}} 待拍",
     "common": "常用",
     "control": "控制",
     "experts": "专家",

@@ -252,6 +252,7 @@
   "nav": {
     "chat": "Conversation",
     "pm": "PM workspace",
+    "pmInbox": "{{count}} to decide",
     "common": "Common",
     "control": "Control",
     "experts": "Experts",

@@ -14,6 +14,8 @@ import { useUpdateStatus } from "../hooks/useUpdateStatus";
 import { prefetchRoute } from "../routes/prefetch";
 import { useServerCapabilities } from "../hooks/useServerCapabilities";
 import { useChatSidebarOpen } from "../pages/Chat/hooks/useChatSidebarState";
+import { usePmInbox } from "../pages/PM/usePmInbox";
+import { navAllowed } from "../utils/permissions";
 import { EXPAND_CHAT_RAIL_EVENT } from "../pages/Chat/components/ChatSidebarPanel";
 import {
   CHAT_HISTORY_RAIL_ID,
@@ -404,9 +406,14 @@ export default function Sidebar({
   const { layoutMode, minimalPane, setMinimalPane } = useLayoutMode();
   const isMinimal = layoutMode === "minimal";
   const onChatPath = isChatPath(location.pathname);
+  const pmInbox = usePmInbox(navAllowed(user, "pm"));
   const catalog = useMemo(
-    () => buildNavSections(user, { mobileEnabled }),
-    [user, mobileEnabled],
+    () =>
+      buildNavSections(user, {
+        mobileEnabled,
+        pmInboxBadge: pmInbox > 0 ? t("nav.pmInbox", { count: pmInbox }) : undefined,
+      }),
+    [user, mobileEnabled, pmInbox, t],
   );
   const [savedLayout, setSavedLayout] = useState<SidebarNavLayout | null>(null);
   const [customizerOpen, setCustomizerOpen] = useState(false);

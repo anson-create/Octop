@@ -6,6 +6,7 @@ import type {
   PmEvidence,
   PmExportPlan,
   PmHealth,
+  PmInbox,
   PmIntegration,
   PmMetricRow,
   PmPaged,
@@ -64,6 +65,7 @@ function json(body: unknown): RequestInit {
 export const pmApi = {
   // --- health -------------------------------------------------------------
   health: () => request<PmHealth>("/pm/health"),
+  inbox: () => request<PmInbox>("/pm/inbox"),
   sweep: () => request<PmSweepResult>("/pm/internal/sweep", { method: "POST" }),
 
   // --- workspaces ---------------------------------------------------------

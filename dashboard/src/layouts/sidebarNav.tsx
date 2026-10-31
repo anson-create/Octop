@@ -151,7 +151,7 @@ export function isGroupedNavKey(key: string): boolean {
 
 export function buildNavSections(
   user: OctopUser | null,
-  opts?: { mobileEnabled?: boolean },
+  opts?: { mobileEnabled?: boolean; pmInboxBadge?: string },
 ): NavSection[] {
   const topItems: NavItem[] = [
     {
@@ -167,6 +167,9 @@ export function buildNavSections(
       path: "/pm",
       icon: <ClipboardList size={iconSize} strokeWidth={iconStroke} />,
       labelKey: "nav.pm",
+      // A card waiting on a human is the one thing in this product that is
+      // actively decaying: the badge is how it stops expiring unseen.
+      badge: opts?.pmInboxBadge,
     });
   }
   if (navAllowed(user, "experts")) {

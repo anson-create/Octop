@@ -215,6 +215,15 @@ def _parse_log_max_bytes() -> int:
         return DEFAULT_LOG_MAX_BYTES
 
 
+def _pm_sweep_seconds() -> float:
+    """How often the PM card sweeper runs. 0 disables it (tests, single-shot runs)."""
+    raw = (os.environ.get("OCTOP_PM_SWEEP_SECONDS", "30") or "30").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 30.0
+
+
 class _OctopLogFormatter(logging.Formatter):
     """Process log line, with the active harness agent id when one is in scope."""
 
@@ -334,6 +343,7 @@ class OctopServer:
         self._ldap_bind_throttle_services: SharedServices | None = None
         # PM 需求方案工作台 service (None until the control-plane DB is bound).
         self.pm_service: Any | None = None
+        self._pm_sweep_task: asyncio.Task[None] | None = None
 
     # Backward compat: expose user_manager directly
     @property
@@ -703,6 +713,34 @@ class OctopServer:
         if self.pm_service is not None:
             with suppress(Exception):
                 self.pm_service.attach_models(lambda: registry.host_models)
+
+            # A card deadline only means something if something reads the clock.
+            # Without this loop L1/L2 cards sit at "pending" forever, the task
+            # quietly stalls, and nobody learns until a human happens to look.
+            interval = _pm_sweep_seconds()
+
+            async def _pm_sweep_loop() -> None:
+                # Let startup settle first: migrations, provider probes and the
+                # bridge resume all compete for the same first seconds.
+                await asyncio.sleep(min(20.0, interval))
+                while True:
+                    service = self.pm_service
+                    if service is not None:
+                        try:
+                            # An auto-answered card resumes its step, which calls the
+                            # model and blocks for tens of seconds. Keep it off the
+                            # event loop or every websocket stalls with it.
+                            result = await asyncio.to_thread(service.sweep)
+                            if result.get("auto_answered") or result.get("expired"):
+                                logger.info("pm sweep: %s", result)
+                        except Exception:  # noqa: BLE001 - never kill the loop
+                            logger.exception("pm sweep failed")
+                    await asyncio.sleep(interval)
+
+            if interval > 0:
+                self._pm_sweep_task = asyncio.create_task(
+                    _pm_sweep_loop(), name="pm-sweep"
+                )
 
     async def refresh_plugin_channels(self) -> None:
         """Reconcile only changed kinds and report registration failures to callers."""

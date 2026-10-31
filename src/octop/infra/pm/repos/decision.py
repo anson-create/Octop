@@ -197,6 +197,47 @@ class DecisionRepo:
             ).fetchall()
         return [Decision.from_row(row) for row in rows]
 
+    def inbox_stats(
+        self, *, user_id: int | None = None, now: str | None = None
+    ) -> dict[str, object]:
+        """Pending-card counts for the sidebar badge.
+
+        Unassigned cards count as everyone's: a card nobody owns is exactly the
+        one that expires unseen, so hiding it from the badge would defeat the
+        badge's purpose.
+        """
+        stamp = now or now_iso()
+        where = "status = 'pending'"
+        params: builtins.list[object] = []
+        if user_id is not None:
+            where += " AND (assignee_user_id = ? OR assignee_user_id IS NULL)"
+            params.append(user_id)
+        with self._db.connect() as conn:
+            rows = conn.execute(
+                f"SELECT level, timeout_at FROM pm_decision WHERE {where}", params
+            ).fetchall()
+        # Pending cards are bounded by design (the sweeper retires them), so folding
+        # in Python keeps one query shape working on both SQLite and PostgreSQL.
+        by_level: dict[str, int] = {}
+        pending = overdue = 0
+        next_at: str | None = None
+        for row in rows:
+            level = str(cell(row, "level", 0) or "")
+            when = cell(row, "timeout_at", 1)
+            pending += 1
+            by_level[level] = by_level.get(level, 0) + 1
+            if isinstance(when, str):
+                if when <= stamp:
+                    overdue += 1
+                if next_at is None or when < next_at:
+                    next_at = when
+        return {
+            "pending": pending,
+            "overdue": overdue,
+            "by_level": by_level,
+            "next_timeout_at": next_at,
+        }
+
     def overturned_rate(self) -> tuple[int, int]:
         with self._db.connect() as conn:
             row = conn.execute(
