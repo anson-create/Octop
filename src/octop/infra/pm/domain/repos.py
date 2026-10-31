@@ -1,0 +1,256 @@
+"""Which repository a requirement lands in — decided by the Jira project key.
+
+A prototype is only 1:1 with a product if it is derived from that product's own
+source. That makes "which repo?" a correctness question, not a routing detail:
+deriving a CargoWareX page from CargoWare's Vue 2 + Element UI code produces
+markup that is wrong in every way that matters — component library, tokens,
+class names, styling strategy.
+
+Two systems, two layers each:
+
+    cargoware    web  Vue 2.6 + Element UI 2.15      api  Java (Maven, 18 modules)
+    cargowarex   web  Vue 3.4 + Arco 2.57 + Tailwind api  Java (Maven)
+
+The mapping runs **Jira project key -> repository**, never a keyword search over
+every checkout. A keyword search would sooner or later read the wrong product's
+source and then produce a confident, structurally faithful, completely wrong
+prototype — the worst possible failure, because it looks right.
+
+``DEFAULT_PROJECT_SYSTEM`` only seeds the two projects we know. Project keys are
+chosen per Jira instance, so the authoritative map is the one saved against the
+integration (``pm_integration.mapping['projects']``) and edited in the UI from the
+real project list Jira reports. Anything unmapped resolves to ``None`` and the
+caller must ask — never guess.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+# Jira project key -> product system. Seed values only; a saved mapping wins.
+DEFAULT_PROJECT_SYSTEM: dict[str, str] = {
+    "CCTOWER": "cargowarex",
+    "CARGO": "cargoware",
+}
+
+SYSTEMS = ("cargoware", "cargowarex")
+
+# Framework families decide how the prototype is rendered. Vue 2 and Vue 3 need
+# different SSR packages and have different component resolution rules, so this
+# is not cosmetic metadata.
+FRAMEWORK_VUE3 = "vue3"
+FRAMEWORK_VUE2 = "vue2"
+FRAMEWORK_JAVA = "java"
+
+
+@dataclass(frozen=True)
+class RepoSpec:
+    """One checkout of one layer of one product."""
+
+    key: str
+    system: str
+    layer: str  # web | api
+    framework: str
+    ui_lib: str = ""
+    # Where the read-only mirror lives on the host running the PM service.
+    mirror: str = ""
+    # Recorded at sync time; empty means "unknown, must be fingerprinted".
+    git_ref: str = ""
+
+    @property
+    def is_web(self) -> bool:
+        return self.layer == "web"
+
+    @property
+    def renderable(self) -> bool:
+        """Only a Vue front-end can be rendered into a prototype."""
+
+        return self.framework in (FRAMEWORK_VUE3, FRAMEWORK_VUE2)
+
+    def root(self) -> Path:
+        return Path(self.mirror) if self.mirror else Path("/nonexistent")
+
+
+# Mirror layout is deliberately flat and predictable: one directory per spec key.
+# Anything else (a developer's checkout, an iCloud copy) is a local override, not
+# the baseline the service reads.
+_DEFAULT_MIRROR_ROOT = "/opt/pm-mirror"
+
+REPOS: dict[str, RepoSpec] = {
+    "cwx-web": RepoSpec(
+        key="cwx-web",
+        system="cargowarex",
+        layer="web",
+        framework=FRAMEWORK_VUE3,
+        ui_lib="arco",
+        mirror=f"{_DEFAULT_MIRROR_ROOT}/cwx-platform-admin",
+    ),
+    "cwx-api": RepoSpec(
+        key="cwx-api",
+        system="cargowarex",
+        layer="api",
+        framework=FRAMEWORK_JAVA,
+        mirror=f"{_DEFAULT_MIRROR_ROOT}/cwx-api",
+    ),
+    "cw-web": RepoSpec(
+        key="cw-web",
+        system="cargoware",
+        layer="web",
+        framework=FRAMEWORK_VUE2,
+        ui_lib="element-ui",
+        mirror=f"{_DEFAULT_MIRROR_ROOT}/cw-web",
+    ),
+    "cw-api": RepoSpec(
+        key="cw-api",
+        system="cargoware",
+        layer="api",
+        framework=FRAMEWORK_JAVA,
+        mirror=f"{_DEFAULT_MIRROR_ROOT}/cw-api",
+    ),
+}
+
+
+def project_key_of(issue_key: str) -> str:
+    """``CCTOWER-3597`` -> ``CCTOWER``.
+
+    Jira's own ``fields.project.key`` is preferred where available; this is the
+    fallback for rows that only stored the issue key (everything created before
+    the project was recorded in the baseline).
+    """
+
+    return (issue_key or "").strip().split("-", 1)[0].strip().upper()
+
+
+@dataclass(frozen=True)
+class ProjectBinding:
+    """The resolved answer to "which source does this requirement belong to"."""
+
+    project: str
+    system: str
+    repos: tuple[str, ...]
+    origin: str  # "mapping" (saved and explicit) | "default" (seed table)
+
+    def spec(self, layer: str) -> RepoSpec | None:
+        for key in self.repos:
+            spec = REPOS.get(key)
+            if spec is not None and spec.layer == layer:
+                return spec
+        return None
+
+    @property
+    def web(self) -> RepoSpec | None:
+        return self.spec("web")
+
+    @property
+    def api(self) -> RepoSpec | None:
+        return self.spec("api")
+
+    def describe(self) -> str:
+        shown = "、".join(self.repos) if self.repos else "未映射"
+        return f"{self.project} → {self.system}（{shown}，来源：{'已保存映射' if self.origin == 'mapping' else '默认表'})"
+
+
+def _parse_target(project: str, value: str) -> ProjectBinding | None:
+    """Accept a system name, a repo key, or a comma-separated repo key list."""
+
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    keys: list[str] = []
+    for piece in raw.split(","):
+        token = piece.strip()
+        if not token:
+            continue
+        if token in SYSTEMS:
+            # A system means "every layer of it", which keeps the mapping usable
+            # before the api mirror is even synced.
+            keys.extend(spec.key for spec in repos_for_system(token))
+        elif token in REPOS:
+            keys.append(REPOS[token].key)
+        else:
+            return None
+    if not keys:
+        return None
+    # Deduplicate while keeping declaration order: web before api matters to the
+    # caller that only wants a page to render.
+    ordered = tuple(dict.fromkeys(keys))
+    system = REPOS[ordered[0]].system
+    if any(REPOS[key].system != system for key in ordered):
+        # A project cannot straddle both products; that mapping is a typo.
+        return None
+    return ProjectBinding(project=project, system=system, repos=ordered, origin="mapping")
+
+
+def resolve_project(
+    project: str,
+    overrides: Mapping[str, str] | None = None,
+) -> ProjectBinding | None:
+    """Resolve one Jira project key to its repositories.
+
+    ``overrides`` is the saved mapping from the integration row. It is consulted
+    first because it reflects what the operator actually configured; the seed
+    table is only a convenience for the two projects we ship knowing about.
+    """
+
+    key = (project or "").strip().upper()
+    if not key:
+        return None
+    if overrides:
+        saved = overrides.get(key)
+        if isinstance(saved, str):
+            binding = _parse_target(key, saved)
+            if binding is not None:
+                return binding
+    system = DEFAULT_PROJECT_SYSTEM.get(key)
+    if system is None:
+        return None
+    return ProjectBinding(
+        project=key,
+        system=system,
+        repos=tuple(spec.key for spec in repos_for_system(system)),
+        origin="default",
+    )
+
+
+def resolve_issue(issue_key: str, overrides: Mapping[str, str] | None = None) -> ProjectBinding | None:
+    return resolve_project(project_key_of(issue_key), overrides)
+
+
+def project_of_requirement(
+    baseline: Mapping[str, Any] | None,
+    source_ref: str,
+) -> str:
+    """The project a stored requirement belongs to.
+
+    Recorded at intake as ``baseline.jira_project``; falls back to the issue key
+    prefix for rows written before that field existed. Never inferred from the
+    requirement's title or text — that would be a keyword guess.
+    """
+
+    recorded = str((baseline or {}).get("jira_project") or "").strip().upper()
+    return recorded or project_key_of(source_ref)
+
+
+def web_repo_for_project(
+    project: str,
+    overrides: Mapping[str, str] | None = None,
+) -> RepoSpec | None:
+    """The one repository a prototype can be derived from, or ``None``."""
+
+    binding = resolve_project(project, overrides)
+    return binding.web if binding is not None else None
+
+
+def project_keys(overrides: Mapping[str, str] | None = None) -> list[str]:
+    """Every project the service can route today, saved mappings first."""
+
+    keys = {key.upper() for key in (overrides or {})}
+    keys.update(DEFAULT_PROJECT_SYSTEM)
+    return sorted(keys)
+
+
+def repos_for_system(system: str) -> list[RepoSpec]:
+    return [spec for spec in REPOS.values() if spec.system == system]

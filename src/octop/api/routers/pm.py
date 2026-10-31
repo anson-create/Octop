@@ -21,6 +21,7 @@ from octop.infra.pm.api.schemas import (
     ChangeCreate,
     IntegrationUpsert,
     JiraConfig,
+    JiraProjectMapping,
     ReflowRequest,
     RejectRequest,
     RequirementFromJira,
@@ -108,6 +109,30 @@ async def jira_issues(
     return pm.list_jira_issues(workspace_id, q=q, limit=limit)
 
 
+@router.get("/jira/projects", summary="Jira projects and which repo each routes to")
+async def jira_projects(
+    workspace_id: int,
+    pm: PMService = Depends(get_pm),
+    _: Any = Depends(require_permission("pm")),
+) -> dict[str, Any]:
+    """The project-code → source-repository map, against Jira's real key list.
+
+    Kept separate from ``/jira/issues`` because it answers a different question:
+    not "what should we build" but "whose source do we read".
+    """
+    return pm.jira_projects(workspace_id)
+
+
+@router.post("/jira/projects/mapping", summary="Map a Jira project to repos")
+async def jira_project_mapping(
+    body: JiraProjectMapping,
+    workspace_id: int,
+    pm: PMService = Depends(get_pm),
+    _: Any = Depends(require_permission("pm_decide")),
+) -> dict[str, Any]:
+    return pm.save_project_mapping(workspace_id, project=body.project, target=body.target)
+
+
 # --- workspaces ------------------------------------------------------------
 
 
@@ -181,6 +206,21 @@ async def requirement_detail(
     _: Any = Depends(require_permission("pm")),
 ) -> dict[str, Any]:
     return pm.requirement_detail(requirement_id)
+
+
+@router.get("/requirements/{requirement_id}/source-repo", summary="Which repo this requirement reads from")
+async def requirement_source_repo(
+    requirement_id: int,
+    pm: PMService = Depends(get_pm),
+    _: Any = Depends(require_permission("pm")),
+) -> dict[str, Any]:
+    """Project code → repository, as resolved for this one requirement.
+
+    Exposed so the mapping is inspectable before a prototype exists: when it is
+    wrong, the failure is a wrong repo name here, not a plausible-looking
+    prototype derived from another product's source.
+    """
+    return pm.requirement_source_repo(requirement_id)
 
 
 @router.post("/requirements/{requirement_id}/changes", summary="Raise a change request")

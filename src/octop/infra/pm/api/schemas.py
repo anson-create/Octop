@@ -56,6 +56,18 @@ class JiraConfig(BaseModel):
     verify_tls: bool = True
 
 
+class JiraProjectMapping(BaseModel):
+    """Which source repositories a Jira project's requirements belong to.
+
+    ``target`` accepts a system name (``cargowarex``), a repo key (``cwx-web``)
+    or a comma-separated list (``cwx-web,cwx-api``). An empty string clears the
+    override, falling back to the built-in seed table.
+    """
+
+    project: str = Field(min_length=1, max_length=64)
+    target: str = Field(default="", max_length=200)
+
+
 class ChangeCreate(BaseModel):
     change_text: str = Field(min_length=1)
     raised_by: int | None = None

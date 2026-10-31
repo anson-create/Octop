@@ -134,6 +134,16 @@ class FakeJiraClient:
             "open_assigned": len(self.issues),
         }
 
+    def projects(self) -> list[dict]:
+        """Mirrors ``GET /rest/api/2/project``: key + name + type, nothing more."""
+
+        self.calls.append(("projects", ""))
+        return [
+            {"key": "CARGO", "name": "CargoWare", "type": "software", "archived": False},
+            {"key": "CCTOWER", "name": "调度塔", "type": "software", "archived": False},
+            {"key": "OPS", "name": "运维支持", "type": "service_desk", "archived": False},
+        ]
+
 
 @pytest.fixture
 def fake_jira(monkeypatch: pytest.MonkeyPatch) -> FakeJiraClient:

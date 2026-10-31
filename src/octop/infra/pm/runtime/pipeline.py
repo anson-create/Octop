@@ -229,6 +229,7 @@ class Pipeline:
         if requirement is not None:
             ctx.requirement_title = requirement.title
             ctx.requirement_text = requirement.raw_text
+            ctx.source_repo = self._source_repo(requirement)
 
         try:
             output = self._executor.run(ctx)
@@ -294,6 +295,55 @@ class Pipeline:
         return [
             {"id": row.id, "public_id": row.public_id, "title": row.title} for row in rows
         ]
+
+    def _source_repo(self, requirement: Any) -> dict[str, Any]:
+        """Resolve the requirement's project code to a source repository.
+
+        Done here rather than inside a step so every step sees the same answer,
+        and so the resolution is visible in the step trace even when the step
+        itself never reads source.
+        """
+
+        from octop.infra.pm.domain.repos import (  # noqa: PLC0415
+            project_of_requirement,
+            resolve_project,
+        )
+
+        overrides: dict[str, str] = {}
+        item = self._repos.integrations.get_by_vendor(requirement.workspace_id, "jira")
+        if item is not None:
+            mapping = loads(item.mapping_json, {}) or {}
+            saved = mapping.get("projects")
+            if isinstance(saved, dict):
+                overrides = {str(key).upper(): str(value) for key, value in saved.items()}
+
+        baseline = loads(getattr(requirement, "baseline_json", None) or "{}", {}) or {}
+        if not isinstance(baseline, dict):
+            baseline = {}
+        project = project_of_requirement(
+            baseline, str(getattr(requirement, "source_ref", "") or "")
+        )
+        if not project:
+            return {"project": "", "mapped": False, "reason": "需求没有关联 Jira 项目"}
+
+        binding = resolve_project(project, overrides)
+        if binding is None:
+            return {
+                "project": project,
+                "mapped": False,
+                "reason": f"Jira 项目 {project} 未映射到源码仓库",
+            }
+        web = binding.web
+        return {
+            "project": project,
+            "mapped": True,
+            "system": binding.system,
+            "repos": list(binding.repos),
+            "origin": binding.origin,
+            "web_repo": web.key if web is not None else "",
+            "mirror": web.mirror if web is not None else "",
+            "mirror_ready": bool(web is not None and web.root().is_dir()),
+        }
 
     def _persist_evidence(self, task_id: int, output: StepOutput) -> list[int]:
         ids: list[int] = []

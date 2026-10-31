@@ -783,6 +783,207 @@ class PMService:
         )
         return self.jira_status(workspace_id)
 
+    def _project_overrides(self, workspace_id: int) -> dict[str, str]:
+        """Saved ``project key -> repo`` map, as edited in the UI."""
+
+        raw = self._jira_mapping(workspace_id).get("projects")
+        if not isinstance(raw, dict):
+            return {}
+        return {str(k).upper(): str(v) for k, v in raw.items() if str(v).strip()}
+
+    def jira_projects(self, workspace_id: int) -> dict[str, Any]:
+        """Jira's real project list, annotated with what each one routes to.
+
+        This is the screen where the operator decides which source repository a
+        project's requirements belong to. It exists because guessing the mapping
+        is not acceptable: reading the wrong product's source produces a
+        prototype that is structurally faithful and entirely wrong.
+        """
+
+        from octop.infra.pm.domain.repos import (  # noqa: PLC0415
+            REPOS,
+            SYSTEMS,
+            resolve_project,
+        )
+        from octop.infra.pm.ports.base import PortError  # noqa: PLC0415
+
+        overrides = self._project_overrides(workspace_id)
+        remote: list[dict[str, Any]] = []
+        error = ""
+        try:
+            with self.jira_client(workspace_id) as client:
+                remote = client.projects()
+        except PortError as exc:
+            error = str(exc)
+
+        items: list[dict[str, Any]] = []
+        for project in remote:
+            key = project["key"]
+            binding = resolve_project(key, overrides)
+            web = binding.web if binding is not None else None
+            items.append(
+                {
+                    **project,
+                    "mapped": binding is not None,
+                    "system": binding.system if binding is not None else "",
+                    "repos": list(binding.repos) if binding is not None else [],
+                    "origin": binding.origin if binding is not None else "",
+                    "web_repo": web.key if web is not None else "",
+                    "mirror_ready": bool(web is not None and web.root().is_dir()),
+                }
+            )
+
+        # A saved mapping for a project this token cannot see is still worth
+        # showing: it usually means a permission problem, not a wrong mapping.
+        seen = {item["key"] for item in items}
+        for key in sorted(overrides):
+            if key in seen:
+                continue
+            binding = resolve_project(key, overrides)
+            items.append(
+                {
+                    "key": key,
+                    "name": "",
+                    "type": "",
+                    "archived": False,
+                    "mapped": binding is not None,
+                    "system": binding.system if binding is not None else "",
+                    "repos": list(binding.repos) if binding is not None else [],
+                    "origin": binding.origin if binding is not None else "",
+                    "web_repo": binding.web.key if binding is not None and binding.web else "",
+                    "mirror_ready": bool(
+                        binding is not None and binding.web is not None and binding.web.root().is_dir()
+                    ),
+                    "invisible_to_token": True,
+                }
+            )
+
+        return {
+            "items": items,
+            "error": error,
+            "systems": list(SYSTEMS),
+            "repo_keys": sorted(REPOS),
+            "overrides": overrides,
+            "unmapped": [item["key"] for item in items if not item["mapped"]],
+        }
+
+    def save_project_mapping(
+        self,
+        workspace_id: int,
+        *,
+        project: str,
+        target: str,
+    ) -> dict[str, Any]:
+        """Persist one ``project -> repo`` mapping.
+
+        ``target`` accepts a system name (``cargowarex``), a repo key
+        (``cwx-web``), or several repo keys (``cwx-web,cwx-api``). An empty
+        ``target`` removes the override, falling back to the seed table.
+        """
+
+        from octop.infra.pm.domain.repos import resolve_project  # noqa: PLC0415
+
+        if self._repos.workspaces.get(workspace_id) is None:
+            raise errors.not_found("workspace", workspace_id)
+        key = (project or "").strip().upper()
+        if not key:
+            raise errors.invalid("project is required")
+
+        mapping = self._jira_mapping(workspace_id)
+        projects = mapping.get("projects")
+        if not isinstance(projects, dict):
+            projects = {}
+        cleaned = (target or "").strip()
+        if not cleaned:
+            projects.pop(key, None)
+        else:
+            if resolve_project(key, {key: cleaned}) is None:
+                raise errors.invalid(
+                    f"无法识别的目标仓库 {cleaned}：填系统名（cargowarex/cargoware）或仓库键（cwx-web 等）"
+                )
+            projects[key] = cleaned
+        mapping["projects"] = projects
+
+        item = self._repos.integrations.get_by_vendor(workspace_id, "jira")
+        self._repos.integrations.upsert(
+            workspace_id=workspace_id,
+            vendor="jira",
+            enabled=bool(item.enabled) if item is not None else True,
+            mode=str(getattr(item, "mode", "real") or "real") if item is not None else "real",
+            credential_ref=getattr(item, "credential_ref", None) if item is not None else None,
+            mapping=mapping,
+        )
+        binding = resolve_project(key, self._project_overrides(workspace_id))
+        return {
+            "project": key,
+            "target": cleaned,
+            "mapped": binding is not None,
+            "system": binding.system if binding is not None else "",
+            "repos": list(binding.repos) if binding is not None else [],
+            "origin": binding.origin if binding is not None else "",
+        }
+
+    def source_repo_for_requirement(self, workspace_id: int, requirement: Any) -> dict[str, Any]:
+        """Which repository a stored requirement's source must be read from.
+
+        Resolution order: the project key recorded at intake, then the issue key
+        in ``source_ref``. Both are Jira facts. There is no keyword fallback —
+        when nothing matches, the answer is a reason, not a guess.
+        """
+
+        from octop.infra.pm.domain.repos import (  # noqa: PLC0415
+            project_of_requirement,
+            resolve_project,
+        )
+
+        baseline = getattr(requirement, "baseline_json", None)
+        if isinstance(baseline, str):
+            baseline = loads(baseline, {}) or {}
+        baseline = baseline if isinstance(baseline, dict) else {}
+
+        project = project_of_requirement(
+            baseline, str(getattr(requirement, "source_ref", "") or "")
+        )
+        if not project:
+            return {
+                "project": "",
+                "mapped": False,
+                "reason": "需求未关联 Jira 项目：source_ref 为空，无法定位源码仓库",
+            }
+
+        binding = resolve_project(project, self._project_overrides(workspace_id))
+        if binding is None:
+            known = "、".join(sorted(self._project_overrides(workspace_id))) or "（尚无已保存映射）"
+            return {
+                "project": project,
+                "mapped": False,
+                "reason": f"Jira 项目 {project} 未映射到任何源码仓库；请先在项目映射里指定。已映射：{known}",
+            }
+
+        web = binding.web
+        return {
+            "project": project,
+            "mapped": True,
+            "system": binding.system,
+            "repos": list(binding.repos),
+            "origin": binding.origin,
+            "web_repo": web.key if web is not None else "",
+            "mirror": web.mirror if web is not None else "",
+            "mirror_ready": bool(web is not None and web.root().is_dir()),
+            "framework": web.framework if web is not None else "",
+            "reason": binding.describe(),
+        }
+
+    def requirement_source_repo(self, requirement_id: int) -> dict[str, Any]:
+        """Expose the resolution for one requirement, so it is auditable."""
+
+        requirement = self._repos.requirements.get(requirement_id)
+        if requirement is None:
+            raise errors.not_found("requirement", requirement_id)
+        result = self.source_repo_for_requirement(requirement.workspace_id, requirement)
+        result["requirement_id"] = requirement_id
+        return result
+
     def jira_client(self, workspace_id: int) -> Any:
         """Build a client from stored config. Raises PortUnavailable when unset."""
         from octop.infra.pm.ports.base import PortUnavailable  # noqa: PLC0415
@@ -862,6 +1063,7 @@ class PMService:
         those fields is ignored, so an edited payload cannot invent a requirement
         that no ticket backs.
         """
+        from octop.infra.pm.domain.repos import project_key_of  # noqa: PLC0415
         from octop.infra.pm.ports.base import PortError  # noqa: PLC0415
 
         key = (issue_key or "").strip().upper()
@@ -905,6 +1107,10 @@ class PMService:
             priority=priority,
             baseline={
                 "jira_key": key,
+                # The project key is what routes every downstream step to a
+                # source repository, so it is recorded as a first-class fact
+                # rather than re-derived from the issue key later.
+                "jira_project": str(issue.get("project") or project_key_of(key)),
                 "jira_status": issue.get("status"),
                 "jira_issue_type": issue.get("issue_type"),
                 "jira_priority": issue.get("priority"),

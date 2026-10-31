@@ -183,6 +183,37 @@ class JiraClient:
         data = self._request("GET", "/rest/api/2/myself")
         return data if isinstance(data, dict) else {}
 
+    def projects(self) -> list[dict[str, Any]]:
+        """The project keys this token can see.
+
+        The mapping from project to repository has to be built against the real
+        key names, not against what we assume the instance uses: a project key is
+        chosen per instance and can be anything. Without this call the operator
+        would be typing keys from memory, and a single typo would silently route
+        a requirement to the wrong product's source.
+        """
+
+        payload = self._request("GET", "/rest/api/2/project")
+        if not isinstance(payload, list):
+            raise JiraError("Jira 项目列表响应格式不对")
+        result: list[dict[str, Any]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            key = _clean_text(item.get("key"))
+            if not key:
+                continue
+            result.append(
+                {
+                    "key": key,
+                    "name": _clean_text(item.get("name")),
+                    "type": _clean_text(item.get("projectTypeKey")),
+                    "archived": bool(item.get("archived", False)),
+                }
+            )
+        result.sort(key=lambda item: item["key"])
+        return result
+
     def search(self, jql: str, *, limit: int = 20) -> list[dict[str, Any]]:
         capped = max(1, min(int(limit), MAX_RESULTS))
         payload = self._request(

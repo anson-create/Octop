@@ -783,6 +783,18 @@ class ModelStepExecutor:
                 confidence=0.6,
             )
         ]
+        source = dict(ctx.source_repo or {})
+        # Say which repository this prototype *should* have come from. Without
+        # this the artifact looks equally credible whether it was derived from the
+        # product's source or invented, which is the confusion we are removing.
+        if source.get("mapped"):
+            source_note = (
+                f"应源自 {source.get('web_repo')}（{source.get('system')}），"
+                f"镜像{'已就绪' if source.get('mirror_ready') else '未同步'}"
+            )
+        else:
+            source_note = f"未能定位源码仓库：{source.get('reason') or '需求未关联 Jira 项目'}"
+
         return StepOutput(
             status="passed",
             artifact={
@@ -790,9 +802,19 @@ class ModelStepExecutor:
                 "title": "交互原型",
                 "audience": "internal",
                 "fidelity": "partial",
-                "fidelity_note": "模型生成的设计稿，静态假数据，未接真实接口，未经设计评审。",
+                "fidelity_note": (
+                    "模型生成的设计稿，静态假数据，未接真实接口，未经设计评审；"
+                    f"且未从源码派生——{source_note}。"
+                ),
                 "origin": "ai",
                 "body": html,
+                "source_repo": {
+                    "project": source.get("project", ""),
+                    "mapped": bool(source.get("mapped")),
+                    "web_repo": source.get("web_repo", ""),
+                    "system": source.get("system", ""),
+                    "derived": False,
+                },
             },
             conclusions=[
                 {
@@ -801,6 +823,7 @@ class ModelStepExecutor:
                     "evidence_indexes": [0],
                 },
                 {"text": "原型为静态假数据，交互行为未联通后端。", "status": "undetermined"},
+                {"text": f"原型未从源码派生，{source_note}。", "status": "undetermined"},
             ],
             evidence=evidence,
             gaps=["原型未经设计评审，交互细节需 UI 确认"],
@@ -809,6 +832,7 @@ class ModelStepExecutor:
                 "tool_calls": ["model.prototype"],
                 "kinds": kinds,
                 "html_len": len(html),
+                "source_repo": source,
             },
         )
 

@@ -38,6 +38,10 @@ class StepContext:
     evidence: list[dict[str, Any]] = field(default_factory=list)
     gaps: list[str] = field(default_factory=list)
     siblings: list[dict[str, Any]] = field(default_factory=list)
+    # Which source repository this requirement belongs to, resolved from the Jira
+    # project code. Empty means "not resolved" — a step that needs source must
+    # then say so instead of drawing something plausible.
+    source_repo: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
