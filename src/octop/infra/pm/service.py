@@ -354,8 +354,12 @@ class PMService:
         task = self._repos.tasks.get(task_id)
         if task is None:
             raise errors.not_found("task", task_id)
-        if task.status != "paused":
-            raise errors.conflict(f"task is {task.status}, not paused")
+        if task.status not in ("paused", "blocked"):
+            raise errors.conflict(f"task is {task.status}, not paused or blocked")
+        # A blocked task has no other way back: ``claim`` only takes queued/running, so
+        # without clearing the lock and re-queueing here, a single failed step would
+        # strand the task until someone reflowed it by hand.
+        self._repos.tasks.release(task_id)
         self._repos.tasks.set_status(task_id, "queued")
         return _task_payload(self._repos.tasks.get(task_id))
 
