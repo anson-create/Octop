@@ -57,6 +57,28 @@ class PMService:
     def pipeline(self) -> Pipeline:
         return self._pipeline
 
+    def attach_models(self, provider: Any | None) -> None:
+        """Wire model-backed steps once the host runtime is up.
+
+        ``_start_pm`` runs before ``_boot_runtime``, so the chat models do not exist
+        yet at construction time. The server calls this after the runtime boots; a
+        ``None`` provider leaves the nine model steps reporting ``executor_unavailable``
+        rather than silently degrading to rule-based guesses.
+        """
+        from octop.infra.pm.runtime.executor import (  # noqa: PLC0415
+            DeterministicExecutor,
+            RegistryExecutor,
+        )
+        from octop.infra.pm.runtime.model_executor import ModelStepExecutor  # noqa: PLC0415
+
+        if provider is None:
+            model_executor = ModelStepExecutor(models_provider=None, repos=self._repos)
+        else:
+            model_executor = ModelStepExecutor(models_provider=provider, repos=self._repos)
+        self._pipeline.set_executor(
+            RegistryExecutor(DeterministicExecutor(), model_executor)
+        )
+
     # --- audit -------------------------------------------------------------
 
     def _record(self, actor: str | None, action: str, target: str, payload: Any = None) -> None:

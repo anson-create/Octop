@@ -697,6 +697,13 @@ class OctopServer:
 
         asyncio.create_task(_resume_bridges(), name="bridge-auto-resume")
 
+        # PM's model-backed steps need the host model factory, which only exists once
+        # the registry above is built. Fail-soft: on failure the nine model steps keep
+        # reporting executor_unavailable instead of taking the server down.
+        if self.pm_service is not None:
+            with suppress(Exception):
+                self.pm_service.attach_models(lambda: registry.host_models)
+
     async def refresh_plugin_channels(self) -> None:
         """Reconcile only changed kinds and report registration failures to callers."""
         from octop.infra.errors import ErrorCode, OctopError
