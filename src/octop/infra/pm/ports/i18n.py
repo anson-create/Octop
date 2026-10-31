@@ -31,12 +31,19 @@ _CATALOGUE_DIRS = (
     "src/i18n/zh-CN",
     "src/i18n/zh",
     "src/lang/zh-CN",
+    "src/lang/zh_CN",
+    "src/lang/zh",
 )
 _CATALOGUE_FILES = (
     "src/i18n/zh-CN.ts",
     "src/i18n/zh.ts",
     "src/locales/zh-CN.ts",
     "src/locales/zh.ts",
+    # CargoWare keeps its root labels here, and they are the section names the
+    # Jira components use: `seaExport: '海运出口'` is the only place 海运出口
+    # exists in source, because the router titles the route `seaExport` instead.
+    "src/lang/zh.js",
+    "src/lang/zh.ts",
 )
 _CATALOGUE_SUFFIXES = (".ts", ".js", ".json")
 
@@ -137,6 +144,7 @@ class I18nIndex:
     entries: list[I18nEntry] = field(default_factory=list)
     files_scanned: tuple[str, ...] = ()
     _df: Counter[str] = field(default_factory=Counter, repr=False)
+    _by_key: dict[str, list[str]] = field(default_factory=dict, repr=False)
 
     @classmethod
     def load(cls, repo_root: Path) -> I18nIndex | None:
@@ -207,6 +215,28 @@ class I18nIndex:
             for bigram in _bigrams(_cjk_only(entry.value)):
                 df[bigram] += 1
         self._df = df
+        by_key: dict[str, list[str]] = {}
+        for entry in self.entries:
+            by_key.setdefault(entry.key.lower(), []).append(entry.value)
+        self._by_key = by_key
+
+    def labels(self, key: str) -> list[str]:
+        """The Chinese a router title stands for, when that title is a key.
+
+        CargoWare titles its routes ``seaExport`` rather than 海运出口, so the
+        router alone cannot tell 海运出口 from 空运出口 — but the catalogue can,
+        because it is the same catalogue the menu renders from.
+
+        Every distinct value is returned: ``partner`` is defined as both
+        ``客户/海外代理`` and ``合作伙伴`` in different files, and only the caller
+        knows which one the ticket meant. Collapsing to the first would be a
+        coin flip dressed as an answer.
+        """
+
+        target = (key or "").strip().lower()
+        if not target:
+            return []
+        return list(dict.fromkeys(self._by_key.get(target, ())))
 
     def _idf(self, bigram: str) -> float:
         total = max(len(self.entries), 1)

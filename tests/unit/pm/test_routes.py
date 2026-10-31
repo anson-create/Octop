@@ -351,3 +351,54 @@ export const routes = [
     entry, candidates = index.resolve("首页")
     assert entry is not None and entry.file == "views/dashboard/index.vue"
     assert len(candidates) == 2, "both routes stay visible as evidence"
+
+
+def test_a_key_titled_route_is_findable_by_its_chinese_label(tmp_path: Path) -> None:
+    """CargoWare titles the sea-export section ``seaExport``; the catalogue says 海运出口."""
+
+    class Catalogue:
+        def labels(self, key: str) -> list[str]:
+            return {"seaExport": ["海运出口"]}.get(key, [])
+
+    body = """
+export default {
+  path: '/SeaExport',
+  component: Layout,
+  meta: { title: 'seaExport' },
+  children: [
+    { path: 'BookingNew',
+      component: () => import('@/views/cargo/v0/SeaExport/bookingNew/index.vue'),
+      meta: { title: '订舱中心' } },
+  ]
+}
+"""
+    root = tmp_path / "cw"
+    module = root / "src" / "router" / "modules" / "cargo" / "v0" / "SeaExport"
+    module.mkdir(parents=True)
+    (module / "index.js").write_text(body, encoding="utf-8")
+    page = root / "src" / "views" / "cargo" / "v0" / "SeaExport" / "bookingNew" / "index.vue"
+    page.parent.mkdir(parents=True)
+    page.write_text("<template><div/></template>", encoding="utf-8")
+
+    index = RouteIndex.load(root, i18n=Catalogue())
+    assert index is not None
+
+    entry, _ = index.resolve("海运出口")
+    assert entry is not None and entry.scope == "SeaExport"
+    found = index.match("海运出口-订舱中心")
+    assert found.entry is not None
+    assert found.entry.file == "views/cargo/v0/SeaExport/bookingNew/index.vue"
+
+
+def test_a_chinese_title_is_never_second_guessed_by_the_catalogue(tmp_path: Path) -> None:
+    """A label is a translation; a title is what the route literally says."""
+
+    class Catalogue:
+        def labels(self, key: str) -> list[str]:
+            return ["被翻译成的东西"]
+
+    index = RouteIndex.load(_repo(tmp_path), i18n=Catalogue())
+    assert index is not None
+
+    entry, _ = index.resolve("订单中心")
+    assert entry is not None and entry.file == "views/order/index.vue"

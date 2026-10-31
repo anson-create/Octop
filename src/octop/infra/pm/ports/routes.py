@@ -21,8 +21,9 @@ Two things this deliberately does not do:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 _IMPORT_RE = re.compile(
     r"""import\(\s*['"]([^'"]+)['"]\s*\)|import\s+[\w{}',\s*]+\s+from\s+['"]([^'"]+)['"]"""
@@ -65,6 +66,11 @@ class RouteEntry:
     # A layout is a frame, not a screen. Several apps route "/" to one and title
     # it 首页, which otherwise competes with the real home page.
     layout: bool = False
+    # What the title means in Chinese, when the title is an i18n key instead of
+    # a label: CargoWare titles its sea-export section ``seaExport``, and only
+    # the catalogue says that is 海运出口. More than one value is possible —
+    # ``partner`` is defined as both 合作伙伴 and 客户/海外代理.
+    labels: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -77,10 +83,27 @@ class RouteEntry:
             "section": self.section,
             "size": self.size,
             "layout": self.layout,
+            "labels": list(self.labels),
         }
 
 
 _COMPOUND_SPLIT = re.compile(r"[-－—_/]")
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _labels_for(entry: RouteEntry, catalogue: Any) -> tuple[str, ...]:
+    """Ask the catalogue what a key-only title means.
+
+    Only for titles that are not already Chinese: a title of 订单中心 needs no
+    translation, and looking it up would match some unrelated catalogue value.
+    """
+
+    if not entry.title or _CJK_RE.search(entry.title):
+        return ()
+    try:
+        return tuple(catalogue.labels(entry.title))
+    except AttributeError:
+        return ()
 
 
 @dataclass(frozen=True)
@@ -284,9 +307,17 @@ class RouteIndex:
         # to be judged by route path. Otherwise the router modules are the areas.
         self._scope_is_app = all(entry.scope == entry.app for entry in entries)
         self._by_title: dict[str, list[RouteEntry]] = {}
-        for entry in entries:
-            self._by_title.setdefault(entry.title, []).append(entry)
+        self._by_label: dict[str, list[RouteEntry]] = {}
+        self._reindex()
         self._mark_sections()
+
+    def _reindex(self) -> None:
+        self._by_title = {}
+        self._by_label = {}
+        for entry in self._entries:
+            self._by_title.setdefault(entry.title, []).append(entry)
+            for label in entry.labels:
+                self._by_label.setdefault(label, []).append(entry)
 
     def repo_path(self, entry: RouteEntry) -> str:
         """The entry's file as the deriver wants it: relative to the repo root.
@@ -326,19 +357,28 @@ class RouteIndex:
                     section=nested,
                     size=entry.size,
                     layout=entry.layout,
+                    labels=entry.labels,
                 )
             )
         self._entries = marked
-        self._by_title = {}
-        for entry in marked:
-            self._by_title.setdefault(entry.title, []).append(entry)
+        self._reindex()
 
     @classmethod
-    def load(cls, repo_root: Path, *, apps: tuple[str, ...] | None = None) -> RouteIndex | None:
+    def load(
+        cls,
+        repo_root: Path,
+        *,
+        apps: tuple[str, ...] | None = None,
+        i18n: Any = None,
+    ) -> RouteIndex | None:
         """Parse every router. ``None`` when the repo has no router at all.
 
         Two layouts, told apart by where ``router/`` sits: a monorepo puts one
         under each sub-app, a single-app repo puts one at ``src/router``.
+
+        ``i18n`` is the repo's Chinese catalogue, used only to translate titles
+        that are keys rather than labels. Passing ``None`` loses that and
+        nothing else.
         """
 
         root = Path(repo_root)
@@ -367,6 +407,10 @@ class RouteIndex:
                 )
         if not entries:
             return None
+        if i18n is not None:
+            entries = [
+                replace(entry, labels=_labels_for(entry, i18n)) for entry in entries
+            ]
         return cls(entries, root=root, single=single)
 
     def __len__(self) -> int:
@@ -377,9 +421,18 @@ class RouteIndex:
         return set(self._by_title)
 
     def lookup(self, title: str) -> list[RouteEntry]:
-        """Every route whose title is exactly this. Empty list means no match."""
+        """Every route whose title — or whose title's label — is exactly this.
 
-        return list(self._by_title.get((title or "").strip(), ()))
+        Falling back to labels is what makes 海运出口 findable in CargoWare,
+        where the route is titled ``seaExport``. An exact title always wins: a
+        label is a translation, a title is what the route literally says.
+        """
+
+        name = (title or "").strip()
+        rows = self._by_title.get(name, [])
+        if rows:
+            return list(rows)
+        return list(self._by_label.get(name, ()))
 
     def resolve(
         self, title: str, *, prefer: tuple[str, ...] = ()

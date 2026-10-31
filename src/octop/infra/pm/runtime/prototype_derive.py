@@ -210,10 +210,18 @@ def route_index(root: Path) -> RouteIndex | None:
     That is a stale-answer failure, not a wrong one: a route that exists but is
     not indexed falls back to the graph, it never produces a page that is not
     in the router.
+
+    The catalogue is handed in because a router may title a route with a key
+    rather than a label — CargoWare's sea-export section is ``seaExport``, and
+    only the catalogue knows that is 海运出口.
     """
 
     path = Path(root)
-    return _cached(f"routes::{root}", path, lambda: RouteIndex.load(path))
+    return _cached(
+        f"routes::{root}",
+        path,
+        lambda: RouteIndex.load(path, i18n=I18nIndex.load(path)),
+    )
 
 
 def clear_cache() -> None:
