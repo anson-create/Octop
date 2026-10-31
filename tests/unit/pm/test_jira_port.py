@@ -167,3 +167,50 @@ def test_query_is_quoted_so_it_cannot_rewrite_the_jql() -> None:
 
     assert '\\"' in captured["jql"]
     assert captured["jql"].count('"') % 2 == 0
+
+
+def test_components_are_read_from_the_project_they_belong_to() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        return httpx.Response(
+            200,
+            json=[
+                {"id": "10102", "name": "运价指数", "lead": {"displayName": "王五"}},
+                {"id": "10101", "name": "费用管理"},
+                {"id": "", "name": "   "},
+            ],
+        )
+
+    with _client(handler) as client:
+        components = client.components("CCTOWER")
+
+    assert seen["path"] == "/rest/api/2/project/CCTOWER/components"
+    assert [item["name"] for item in components] == ["费用管理", "运价指数"]
+    assert components[1]["lead"] == "王五"
+    assert components[0]["lead"] == ""
+
+
+def test_a_project_without_components_is_an_empty_answer_not_an_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[])
+
+    with _client(handler) as client:
+        assert client.components("CCTOWER") == []
+
+
+def test_count_reports_the_total_while_fetching_a_single_issue() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["jql"] = request.url.params.get("jql", "")
+        seen["max"] = request.url.params.get("maxResults", "")
+        return httpx.Response(200, json={"issues": [ISSUE], "total": 42})
+
+    with _client(handler) as client:
+        assert client.count('project = "CCTOWER" AND component = "费用管理"') == 42
+
+    assert seen["max"] == "1"
+    assert "费用管理" in str(seen["jql"])
+

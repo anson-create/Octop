@@ -13,6 +13,7 @@ second connection-pool lifecycle to get wrong.
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -402,6 +403,53 @@ class JiraClient:
             )
         result.sort(key=lambda item: item["key"])
         return result
+
+    def components(self, project_key: str) -> list[dict[str, Any]]:
+        """The functional areas this project actually files issues against.
+
+        ``components`` is the one Jira field that is structurally a functional-area
+        picker rather than free text, which makes it the best anchor we have for
+        locating a page. An empty list is a real answer — the team does not use
+        components — and the caller must say so instead of inferring a mapping.
+        """
+
+        key = _clean_text(project_key)
+        if not key:
+            return []
+        payload = self._request("GET", f"/rest/api/2/project/{quote(key, safe='')}/components")
+        if not isinstance(payload, list):
+            raise JiraError("Jira 组件列表响应格式不对")
+        result: list[dict[str, Any]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            name = _clean_text(item.get("name"))
+            if not name:
+                continue
+            result.append(
+                {
+                    "id": _clean_text(item.get("id")),
+                    "name": name,
+                    "lead": _clean_text((item.get("lead") or {}).get("displayName")),
+                    "description": _clean_text(item.get("description"))[:200],
+                }
+            )
+        result.sort(key=lambda item: item["name"])
+        return result
+
+    def count(self, jql: str) -> int:
+        """How many issues match — separates a live component from a dead one.
+
+        A component nobody files against is a leftover from a rename; mapping it
+        to a page would add a locator signal that never fires. ``maxResults=1``
+        keeps the payload to one issue while still returning ``total``.
+        """
+
+        payload = self._request(
+            "GET", "/rest/api/2/search", params={"jql": jql, "maxResults": 1}
+        )
+        total = payload.get("total") if isinstance(payload, dict) else None
+        return int(total) if isinstance(total, int) else 0
 
     def search(self, jql: str, *, limit: int = 20) -> list[dict[str, Any]]:
         capped = max(1, min(int(limit), MAX_RESULTS))
