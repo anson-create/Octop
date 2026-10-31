@@ -79,7 +79,7 @@ def main() -> int:
     print(f"  自定义字段: {[(i['name'], i['text'][:40]) for i in issue.get('custom_fields') or []]}")
     print(f"  评论数: {len(issue.get('comments') or [])}")
     print(f"  附件: {[i['filename'] for i in issue.get('attachments') or []]}")
-    print(f"\n  权重排序（前 6）:")
+    print("\n  权重排序（前 6）:")
     for source in evidence.ranked()[:6]:
         print(f"    {source.weight:>4}  [{source.kind:<12}] {source.field[:30]:<32} {source.text[:50]!r}")
     if evidence.unread:

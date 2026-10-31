@@ -1,6 +1,5 @@
 """Diagnose why a search hit no renderable file: what kinds of file do the terms land in?"""
 
-import json
 from collections import Counter
 from pathlib import Path
 
