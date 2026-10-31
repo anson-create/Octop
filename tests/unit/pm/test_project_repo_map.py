@@ -12,6 +12,7 @@ import pytest
 
 from octop.infra.pm import errors
 from octop.infra.pm.domain.repos import (
+    REPOS,
     project_key_of,
     project_of_requirement,
     resolve_project,
@@ -25,6 +26,41 @@ def test_issue_key_reduces_to_its_project() -> None:
     assert project_key_of("cargo-1234") == "CARGO"
     assert project_key_of("CCTOWER-3597") == "CCTOWER"
     assert project_key_of("") == ""
+
+# --- renderer selection -----------------------------------------------------
+
+
+def test_each_vue_generation_gets_its_own_renderer() -> None:
+    """Vue 2 has no createSSRApp and no @vue/server-renderer; the scripts differ."""
+
+    assert REPOS["cwx-web"].ssr.script == "render.mjs"
+    assert REPOS["cw-web"].ssr.script == "render.vue2.mjs"
+
+
+def test_an_api_layer_has_no_renderer_at_all() -> None:
+    """Empty means "cannot render", which is not the same as "use the default"."""
+
+    assert REPOS["cw-api"].ssr.script == ""
+    assert REPOS["cw-api"].renderable is False
+
+
+def test_the_vue2_toolchain_is_kept_out_of_the_product_tree() -> None:
+    """CargoWare never depends on vite; putting it there would be wiped by sync."""
+
+    plan = REPOS["cw-web"].ssr
+
+    assert plan.toolchain == "vue2"
+    assert "vue-server-renderer" in plan.toolchain_requirements
+    assert "vite" not in plan.mirror_requirements
+
+
+def test_a_vite_app_renders_from_its_own_node_modules() -> None:
+    """CargoWareX needs no toolchain: vite is already one of its devDependencies."""
+
+    plan = REPOS["cwx-web"].ssr
+
+    assert plan.toolchain == ""
+    assert "vite" in plan.mirror_requirements
 
 
 def test_non_jira_source_ref_is_not_parsed_as_a_ticket() -> None:

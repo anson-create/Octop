@@ -40,6 +40,7 @@ from octop.infra.pm.runtime.prototype_derive import (
     derive_from_source,
     ensure_render_script,
     locate_page,
+    missing_packages,
 )
 from octop.infra.pm.runtime.prototype_source import DerivedPrototype
 
@@ -302,6 +303,84 @@ def test_a_stale_copy_is_overwritten_so_the_wheel_stays_authoritative(tmp_path: 
 
     assert placed is not None
     assert "old version" not in placed.read_text(encoding="utf-8")
+
+
+def test_both_renderers_ship_with_the_wheel() -> None:
+    """Writing a renderer that never reaches the package is a silent no-op."""
+
+    assets = Path(prototype_derive.__file__).parent / "assets"
+    for name in ("render.mjs", "render.vue2.mjs"):
+        assert (assets / name).is_file(), name
+
+
+def test_the_vue2_renderer_goes_into_the_toolchain_not_the_mirror(tmp_path: Path) -> None:
+    """A node_modules of our own inside a product's tree would be wiped by sync."""
+
+    tool = tmp_path / "tool"
+
+    placed = ensure_render_script(tool, "render.vue2.mjs")
+
+    assert placed == tool / "render.vue2.mjs"
+    assert "vue-server-renderer" in placed.read_text(encoding="utf-8")
+
+
+# --- what has to be installed before node is worth spawning ------------------
+
+VUE2_PACKAGES = ("vue", "vue-template-compiler", "element-ui", "vue-router", "vuex", "vue-i18n")
+
+
+def _installed(base: Path, packages: tuple[str, ...]) -> None:
+    """Give a directory the node_modules a renderer looks for."""
+
+    for name in packages:
+        (base / "node_modules" / name).mkdir(parents=True, exist_ok=True)
+
+
+def test_a_mirror_without_dependencies_is_refused_before_node_runs(tmp_path: Path) -> None:
+    """A freshly cloned mirror has no node_modules — say that, not "no json"."""
+
+    root = tmp_path / "mirror"
+    root.mkdir()
+    spec = _spec("cw-web", root)
+    try:
+        outcome = derive_from_source(spec, "海运订舱列表加筛选", timeout_s=1)
+    finally:
+        object.__setattr__(spec, "mirror", "/opt/pm-mirror/cw-web")
+
+    assert outcome.ok is False
+    assert "没有安装依赖" in outcome.reason
+    assert "vue" in outcome.reason
+    assert outcome.prototype is None
+
+
+def test_a_missing_vue2_toolchain_is_named_rather_than_blamed_on_the_page(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    root = tmp_path / "mirror"
+    root.mkdir()
+    _installed(root, VUE2_PACKAGES)
+    monkeypatch.setenv("OCTOP_PM_SSR_TOOLCHAIN", str(tmp_path / "tool"))
+
+    spec = _spec("cw-web", root)
+    try:
+        outcome = derive_from_source(spec, "海运订舱列表加筛选", timeout_s=1)
+    finally:
+        object.__setattr__(spec, "mirror", "/opt/pm-mirror/cw-web")
+
+    assert outcome.ok is False
+    assert "工具链未安装" in outcome.reason
+    assert "vite" in outcome.reason
+
+
+def test_a_hoisted_node_modules_one_level_up_is_accepted(tmp_path: Path) -> None:
+    """A shared install above the mirror is a real layout, not a mistake."""
+
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    _installed(tmp_path, ("vue",))
+
+    assert missing_packages(mirror, ("vue",)) == []
+    assert missing_packages(mirror, ("vite",)) == ["vite"]
 
 
 # --- deriving ---------------------------------------------------------------

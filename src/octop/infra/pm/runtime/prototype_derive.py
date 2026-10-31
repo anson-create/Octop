@@ -9,7 +9,11 @@ Three questions have to be answered in order, and each one can fail honestly:
    code's identifiers through the product's own i18n catalogue, then the
    tree-sitter graph maps identifiers to files.
 3. **Can it be rendered?** ``derive_from_source`` — the repo's own Vite config
-   plus Vue SSR, via ``assets/render.mjs``.
+   plus Vue SSR, via the renderer its framework names (``assets/render.mjs`` for
+   Vue 3, ``assets/render.vue2.mjs`` for Vue 2). The two are not
+   interchangeable, and the prerequisites are checked before node is spawned so
+   that "the mirror has never been installed" is said out loud instead of
+   surfacing as a 240-second timeout.
 
 Every failure returns a reason a human can act on ("mirror not synced", "no code
 graph", "no i18n match", "SSR crashed") instead of an empty string, because the
@@ -23,6 +27,7 @@ rebuilding the graph does not require a service restart.
 
 from __future__ import annotations
 
+import os
 import re
 import threading
 from dataclasses import dataclass, field
@@ -43,10 +48,18 @@ from octop.infra.pm.runtime.prototype_source import (
 # The renderer ships inside the wheel so `pip install` alone enables derivation.
 # It cannot run from there: `import 'vite'` resolves against the *script's*
 # directory, and site-packages has no node_modules. It is therefore copied into
-# the mirror root, which is the one file this service ever writes there —
-# source trees are read-only.
+# a directory that has one — the mirror root for Vue 3, a service-owned
+# toolchain directory for Vue 2 (which needs packages the product never had).
 RENDER_SCRIPT_NAME = "render.mjs"
 _ASSET_DIR = Path(__file__).parent / "assets"
+
+# Where the Vue 2 renderer's own toolchain lives. Deliberately *outside* the
+# mirrors: `ensure_render_script` writing a whole node_modules into a product's
+# source tree would be wiped by the next sync, and polluting a checkout to make
+# a read-only feature work is exactly the kind of side effect that later gets
+# mistaken for a real dependency.
+TOOLCHAIN_ROOT_ENV = "OCTOP_PM_SSR_TOOLCHAIN"
+_DEFAULT_TOOLCHAIN_ROOT = "/opt/pm-mirror/.ssr"
 
 # A page-level hit beats a component hit, but a component is still a legitimate
 # answer (some products put the whole screen in one). Only files we can actually
@@ -234,14 +247,18 @@ def clear_cache() -> None:
 # --- renderer placement -----------------------------------------------------
 
 
-def ensure_render_script(root: Path) -> Path | None:
-    """Copy the packaged renderer into ``root`` if it is missing or stale.
+def ensure_render_script(
+    base: Path, name: str = RENDER_SCRIPT_NAME
+) -> Path | None:
+    """Copy the packaged renderer into ``base`` if it is missing or stale.
 
-    Returns the path to run, or ``None`` when the asset is not in the wheel
-    (a source checkout that skipped the build, for instance).
+    ``base`` is whichever directory has a ``node_modules`` the script can use —
+    the mirror root for Vue 3, the toolchain directory for Vue 2. Returns the
+    path to run, or ``None`` when the asset is not in the wheel (a source
+    checkout that skipped the build, for instance).
     """
 
-    asset = _ASSET_DIR / RENDER_SCRIPT_NAME
+    asset = _ASSET_DIR / name
     if not asset.is_file():
         return None
     try:
@@ -249,7 +266,7 @@ def ensure_render_script(root: Path) -> Path | None:
     except OSError:
         return None
 
-    target = Path(root) / RENDER_SCRIPT_NAME
+    target = Path(base) / name
     if target.is_file():
         try:
             if target.read_bytes() == payload:
@@ -258,12 +275,39 @@ def ensure_render_script(root: Path) -> Path | None:
             # Unreadable copy: fall through and try to overwrite it.
             pass
     try:
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(payload)
     except OSError:
-        # A read-only mirror that already carries a renderer still works — it
+        # A read-only directory that already carries a renderer still works — it
         # may just be an older one. Say so by returning it rather than failing.
         return target if target.is_file() else None
     return target
+
+
+def toolchain_dir(name: str) -> Path:
+    """Where one framework's out-of-tree SSR toolchain is installed."""
+
+    root = os.environ.get(TOOLCHAIN_ROOT_ENV) or _DEFAULT_TOOLCHAIN_ROOT
+    return Path(root) / name
+
+
+def missing_packages(root: Path, names: tuple[str, ...]) -> list[str]:
+    """Packages from ``names`` that node cannot resolve from ``root``.
+
+    Node walks up from the importing file, so a hoisted ``node_modules`` one
+    level above the mirror is a legitimate layout and is accepted. Anything
+    deeper is not followed: at that distance the "package found" answer stops
+    describing this repository and starts describing the host.
+    """
+
+    if not names:
+        return []
+    search = [Path(root), Path(root).parent]
+    missing: list[str] = []
+    for name in names:
+        if not any((base / "node_modules" / name).is_dir() for base in search):
+            missing.append(name)
+    return missing
 
 
 # --- locating ---------------------------------------------------------------
@@ -705,15 +749,50 @@ def derive_from_source(
             ok=False,
             reason=f"{spec.key} 不是前端仓库（{spec.framework}），无法渲染成原型",
         )
+    plan = spec.ssr
+    if not plan.script:
+        return DerivationOutcome(
+            ok=False,
+            reason=f"{spec.key} 的框架 {spec.framework} 没有配套的 SSR 渲染器",
+        )
     root = spec.root()
     if not root.is_dir():
         return DerivationOutcome(
             ok=False, reason=f"源码镜像未同步：{root} 不存在，先跑同步脚本"
         )
 
-    script = ensure_render_script(root)
+    # Dependency checks run *before* locating, because they are cheap and they
+    # name a cause the operator can act on. Without it the run spends its time
+    # scanning the graph and then reports "ssr produced no json", which is the
+    # truth but not the reason.
+    absent = missing_packages(root, plan.mirror_requirements)
+    if absent:
+        return DerivationOutcome(
+            ok=False,
+            reason=(
+                f"源码镜像没有安装依赖（缺 {'、'.join(absent)}），node 起不来："
+                f"先在 {root} 里装一次依赖"
+            ),
+        )
+
+    base = root
+    if plan.toolchain:
+        base = toolchain_dir(plan.toolchain)
+        absent = missing_packages(base, plan.toolchain_requirements)
+        if absent:
+            return DerivationOutcome(
+                ok=False,
+                reason=(
+                    f"Vue 2 渲染工具链未安装：{base} 缺 {'、'.join(absent)}。"
+                    "该工具链不在产品仓库里，需在服务器上按 docs/deploy 的说明装一次"
+                ),
+            )
+
+    script = ensure_render_script(base, plan.script)
     if script is None:
-        return DerivationOutcome(ok=False, reason="包内缺少 render.mjs，无法执行 SSR 渲染")
+        return DerivationOutcome(
+            ok=False, reason=f"包内缺少 {plan.script}，无法执行 SSR 渲染"
+        )
 
     prefer = (spec.preferred_app,) if spec.preferred_app else ()
     location = locate_page(root, text, evidence=evidence, prefer=prefer)

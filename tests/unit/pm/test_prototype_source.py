@@ -7,9 +7,13 @@ the token table had to come from the product's own CSS, not from the model).
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
+import pytest
+
 from octop.infra.pm.domain.repos import REPOS
+from octop.infra.pm.runtime import prototype_source
 from octop.infra.pm.runtime.prototype_source import (
     PrototypeDeriver,
     SsrRenderer,
@@ -133,6 +137,116 @@ def test_renderer_reports_a_missing_mirror_before_spawning_node(tmp_path: Path) 
     result = renderer.render(tmp_path / "absent", PAGE)
     assert result.ok is False
     assert "mirror missing" in result.message
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_vue2_renderer_fails_in_the_shape_the_caller_parses(tmp_path: Path) -> None:
+    """A renderer that crashes unparsed is indistinguishable from a timeout.
+
+    This machine has no node_modules for CargoWare and no network to install
+    them, so the render itself cannot be exercised here. What *can* be pinned is
+    the contract the Python side depends on: whatever happens, the script exits
+    with one JSON object and a message naming the missing piece — not a stack
+    trace that leaves ``SsrRenderer`` reporting "ssr produced no json".
+    """
+
+    assets = Path(prototype_source.__file__).parent / "assets"
+    renderer = SsrRenderer(assets / "render.vue2.mjs", timeout_s=60)
+
+    result = renderer.render(tmp_path, PAGE)
+
+    assert result.ok is False
+    assert result.html == ""
+    assert "no json" not in result.message
+    assert any(
+        name in result.message for name in ("vite", "vue-server-renderer", "Vue 2 SFC plugin")
+    )
+
+
+# --- the Vue 2 renderer's own wiring ----------------------------------------
+#
+# The real toolchain (vite + vite-plugin-vue2 + vue-server-renderer) cannot be
+# installed here: the mirror has no node_modules and there is no network. These
+# stand-ins are not a substitute for rendering a real page — they are a check
+# that the *script* calls things in the right order and speaks the JSON its
+# caller parses, which is the part that would otherwise be pure assertion.
+
+_TOOLCHAIN = {
+    "vite/package.json": '{"name":"vite","type":"module","main":"index.js"}',
+    "vite/index.js": """
+const Page = { name: 'FakePage', render: (h) => h('div', { class: 'page-container' }, 'hi') }
+
+function FakeVue(options) { this.$options = options }
+FakeVue.version = '2.6.10'
+FakeVue.config = {}
+FakeVue.use = () => {}
+
+export async function createServer() {
+  return {
+    async ssrLoadModule(spec) {
+      if (spec === 'vue') return { default: FakeVue }
+      if (spec === 'vue-template-compiler') return { default: { version: '2.6.10' } }
+      if (spec === 'element-ui') return { default: { install() {} } }
+      if (spec === 'vue-router') return { default: class Router { constructor() {} } }
+      if (spec === '/src/views/x.vue') return { default: Page }
+      throw new Error('not a module: ' + spec)
+    },
+    async close() {},
+  }
+}
+""",
+    "vite-plugin-vue2/package.json": '{"name":"vite-plugin-vue2","type":"module","main":"index.js"}',
+    "vite-plugin-vue2/index.js": "export default function vue2() { return { name: 'vite:vue2' } }\n",
+    "vue-server-renderer/package.json": (
+        '{"name":"vue-server-renderer","type":"module","main":"index.js"}'
+    ),
+    "vue-server-renderer/index.js": """
+export function createRenderer() {
+  return {
+    async renderToString() {
+      return '<div class="page-container" data-ssr="1">hi</div>'
+    },
+  }
+}
+""",
+}
+
+
+def _write_tree(base: Path, files: dict[str, str]) -> None:
+    for relative, content in files.items():
+        path = base / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_vue2_renderer_renders_once_a_toolchain_is_present(tmp_path: Path) -> None:
+    """The orchestration is testable even when Vue itself is not installed.
+
+    Places the real script with the real `ensure_render_script`, gives it a
+    toolchain that answers the way Vite does, and checks the page's own markup
+    comes back. What this does *not* prove is that Vite and vue-server-renderer
+    behave like these stand-ins — only that the script asks them for the right
+    things in the right order.
+    """
+
+    from octop.infra.pm.runtime.prototype_derive import ensure_render_script
+
+    tool = tmp_path / "tool"
+    script = ensure_render_script(tool, "render.vue2.mjs")
+    assert script is not None
+    _write_tree(tool / "node_modules", _TOOLCHAIN)
+
+    mirror = tmp_path / "mirror"
+    (mirror / "src").mkdir(parents=True)
+
+    result = SsrRenderer(script, timeout_s=60).render(mirror, "src/views/x.vue")
+
+    assert result.ok is True
+    assert "page-container" in result.html
+    assert "vue:2.6.10" in result.components
+    assert "element-ui:global" in result.components
+    assert "plugin:vite-plugin-vue2" in result.components
 
 
 def test_derivation_failure_never_claims_exact_fidelity(tmp_path: Path) -> None:

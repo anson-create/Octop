@@ -45,6 +45,65 @@ FRAMEWORK_VUE3 = "vue3"
 FRAMEWORK_VUE2 = "vue2"
 FRAMEWORK_JAVA = "java"
 
+# Renderer asset names inside ``runtime/assets/``. These are filenames shipped in
+# the wheel, not deployment paths — the deployment path is decided at run time.
+RENDERER_VUE3 = "render.mjs"
+RENDERER_VUE2 = "render.vue2.mjs"
+
+
+@dataclass(frozen=True)
+class SsrPlan:
+    """How to render this repository, and what has to exist before it can.
+
+    Split out because the two Vue generations differ in *where* their toolchain
+    lives, and getting that wrong is not a cosmetic mistake:
+
+    * **Vue 3** is built with Vite. The renderer boots the repo's own Vite config
+      and resolves ``vite`` from the mirror, so the only prerequisite is that the
+      mirror has been ``npm ci``-ed.
+    * **Vue 2** (CargoWare) is built with webpack 4. It has no ``vite`` and no
+      ``vue-server-renderer`` — those two plus a Vue 2 SFC plugin are the
+      renderer's own toolchain. Installing them into the product's tree would
+      both pollute a source tree that is re-synced by script and be wiped by the
+      next sync, so they live in a service-owned directory beside the mirrors.
+
+    ``mirror_requirements`` are package names resolved from the mirror's
+    ``node_modules``; ``toolchain_requirements`` from the toolchain directory's.
+    """
+
+    script: str
+    mirror_requirements: tuple[str, ...] = ()
+    toolchain: str = ""
+    toolchain_requirements: tuple[str, ...] = ()
+
+
+# Empty ``script`` means "this repository cannot be rendered at all" — an api
+# layer, and anything whose framework is not a browser UI.
+_SSR_PLANS: dict[str, SsrPlan] = {
+    FRAMEWORK_VUE3: SsrPlan(
+        script=RENDERER_VUE3,
+        # `vite` is a devDependency of every Vite app: an install done with
+        # --omit=dev produces a mirror that renders nothing, so it is checked.
+        mirror_requirements=("vue", "vue-router", "vite"),
+    ),
+    FRAMEWORK_VUE2: SsrPlan(
+        script=RENDERER_VUE2,
+        mirror_requirements=(
+            "vue",
+            "vue-template-compiler",
+            "element-ui",
+            "vue-router",
+            "vuex",
+            "vue-i18n",
+        ),
+        # Pinned by the renderer to match the mirror: vue-server-renderer and
+        # vue-template-compiler must be the same major.minor as the app's vue,
+        # otherwise Vue refuses to render at all.
+        toolchain="vue2",
+        toolchain_requirements=("vite", "vite-plugin-vue2", "vue-server-renderer"),
+    ),
+}
+
 
 @dataclass(frozen=True)
 class RepoSpec:
@@ -75,6 +134,17 @@ class RepoSpec:
         """Only a Vue front-end can be rendered into a prototype."""
 
         return self.framework in (FRAMEWORK_VUE3, FRAMEWORK_VUE2)
+
+    @property
+    def ssr(self) -> SsrPlan:
+        """The renderer for this framework, or a plan with no script.
+
+        Callers must treat an empty ``script`` as "cannot render", never as
+        "use the default one" — using the Vue 3 renderer on a Vue 2 page is how
+        a prototype ends up structurally faithful to the wrong product.
+        """
+
+        return _SSR_PLANS.get(self.framework, SsrPlan(script=""))
 
     def root(self) -> Path:
         return Path(self.mirror) if self.mirror else Path("/nonexistent")
