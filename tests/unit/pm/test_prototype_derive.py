@@ -360,7 +360,10 @@ def test_a_mirror_without_dependencies_still_yields_a_baseline(tmp_path: Path) -
     assert outcome.baseline is not None
     assert outcome.baseline.usable
     assert outcome.baseline.page.endswith("vendor/index.vue")
-    assert outcome.baseline.classes == ("page",)
+    assert {"page", "page__filter", "page__table"} <= set(outcome.baseline.classes)
+    # The copy is resolved through the language pack when one exists; here there
+    # is none, so the page's own literal Chinese is what anchors the fidelity.
+    assert outcome.baseline.anchors
     # No render happened, so there is nothing to measure — and the outcome says
     # so rather than reporting a fabricated zero.
     assert outcome.prototype is None
@@ -686,6 +689,46 @@ export const routes = [
 """
 
 
+# A page fixture that is shaped like a real one rather than a two-line stub.
+# The baseline now refuses anything that is too thin to describe a screen (three
+# classes, some copy and a form's worth of markup), because a 35-character page
+# transcribes to an empty frame that would still be labelled 1:1 — so the fixture
+# has to carry enough structure for the "is it usable" question to be meaningful.
+ROUTED_PAGE = """<template>
+  <div class="page">
+    <a-form :model="query" layout="inline" class="page__filter">
+      <a-form-item label="供应商编码"><a-input v-model="query.code" /></a-form-item>
+      <a-form-item label="供应商名称"><a-input v-model="query.name" /></a-form-item>
+      <a-form-item label="所属区域"><a-select v-model="query.region" /></a-form-item>
+      <a-form-item label="合作状态"><a-select v-model="query.status" /></a-form-item>
+      <a-form-item label="创建时间"><a-range-picker v-model="query.createdAt" /></a-form-item>
+      <a-button type="primary" @click="search">查询</a-button>
+      <a-button @click="reset">重置</a-button>
+      <a-button type="outline" @click="create">新建供应商</a-button>
+    </a-form>
+    <a-table :columns="columns" :data="rows" class="page__table" row-key="code">
+      <template #status="{ record }"><a-tag>{{ record.status }}</a-tag></template>
+      <template #actions="{ record }">
+        <a-link @click="edit(record)">编辑</a-link>
+        <a-link @click="remove(record)">停用</a-link>
+      </template>
+    </a-table>
+    <a-pagination :total="total" show-total class="page__pager" />
+  </div>
+</template>
+
+<script>
+export default {
+  name: 'VendorIndex',
+  data() {
+    return { query: {}, rows: [], total: 0, columns: [{ title: '供应商编码', dataIndex: 'code' }] }
+  },
+  methods: { search() {}, reset() {}, create() {}, edit() {}, remove() {} },
+}
+</script>
+"""
+
+
 def _routed_repo(tmp_path: Path, *, graph: dict[str, Any] | None = None) -> Path:
     """A mirror with a router but, unless asked, no code graph at all."""
 
@@ -696,7 +739,7 @@ def _routed_repo(tmp_path: Path, *, graph: dict[str, Any] | None = None) -> Path
     for name in ("vendor", "order"):
         page = root / "control-tower" / "src" / "views" / name / "index.vue"
         page.parent.mkdir(parents=True, exist_ok=True)
-        page.write_text('<template><div class="page"><a-table /></div></template>', encoding="utf-8")
+        page.write_text(ROUTED_PAGE, encoding="utf-8")
     if graph is not None:
         (root / "graphify-out").mkdir(parents=True)
         (root / "graphify-out" / "graph.json").write_text(

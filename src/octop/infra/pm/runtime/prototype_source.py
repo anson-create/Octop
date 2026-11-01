@@ -41,7 +41,48 @@ _CLASS_BIND_RE = re.compile(r""":class\s*=\s*["']([^"']+)["']""")
 # Tailwind utilities and project BEM-ish names both look like this. Rejecting
 # anything outside it keeps `{{ }}` expressions and ternaries out of the set.
 _CLASS_TOKEN_RE = re.compile(r"^[A-Za-z][\w\-:/\[\]\.%]{0,60}$")
-_SFC_TEMPLATE_RE = re.compile(r"<template>(.*?)</template>", re.DOTALL)
+def block_body(text: str, tag: str) -> str | None:
+    """Body of the outermost ``<tag>…</tag>``, counting nesting.
+
+    A non-greedy regex stops at the *first* closing tag, and Vue slot templates
+    nest: ``bookingTreeGrid.vue`` contains five ``<template>`` tags, so the naive
+    pattern returned 19 699 of the element's 73 837 characters — 73% of the
+    screen was dropped before anything downstream saw it. The same cut silently
+    shrank the copy-anchor set to a seventh of its real size, which made a
+    perfect transcription score near zero.
+
+    Returns ``None`` when the tag is absent, so callers can still tell "no block"
+    from "empty block".
+    """
+
+    if not text:
+        return None
+    token_re = re.compile(rf"<{tag}\b[^>]*>|</{tag}\s*>", re.IGNORECASE)
+    depth = 0
+    start = -1
+    for match in token_re.finditer(text):
+        token = match.group(0)
+        if token.startswith("</"):
+            depth -= 1
+            if depth == 0 and start >= 0:
+                return text[start : match.start()]
+            continue
+        if token.rstrip().endswith("/>"):
+            # `<template />` opens nothing.
+            if depth == 0 and start < 0:
+                return ""
+            continue
+        depth += 1
+        if depth == 1 and start < 0:
+            start = match.end()
+    if start < 0:
+        return None
+    # Unterminated block: hand back the tail rather than nothing.
+    return text[start:]
+
+
+def template_body(text: str) -> str | None:
+    return block_body(text, "template")
 _SFC_STYLE_RE = re.compile(r"<style([^>]*)>(.*?)</style>", re.DOTALL)
 
 
@@ -124,6 +165,215 @@ _SFC_SCRIPT_RE = re.compile(r"<script([^>]*)>(.*?)</script>", re.DOTALL)
 # have no dash and are not interesting here — they carry no library semantics.
 _COMPONENT_TAG_RE = re.compile(r"<([a-z][a-z0-9]*(?:-[a-z0-9]+)+)[\s/>]")
 
+# UI-library tags. They are components too, but their source is in `node_modules`
+# (or nowhere), so expanding them would only produce noise. Everything else with
+# a dash is a project-local component and is a candidate for expansion.
+_LIBRARY_PREFIXES = ("el-", "a-", "van-", "arco-", "ant-", "n-", "v-", "router-")
+
+# `import bookingTreeGrid from './components/booking/bookingTreeGrid'`
+# The default and named forms both appear in these repos; only the local path is
+# interesting, so the specifier is captured loosely and filtered afterwards.
+_IMPORT_RE = re.compile(
+    r"""import\s+(?:(\w+)|\{([^}]*)\})\s+from\s+["']([^"']+)["']""",
+)
+
+# `$t('CargoMsg.Cargo_ARAP')` and `$t("...")` — the only way this product emits
+# user-visible copy. There is no hard-coded Chinese in the CARGO pages at all.
+_I18N_CALL_RE = re.compile(r"""\$t\(\s*["']([A-Za-z][\w.\-]+)["']""")
+
+# A Chinese string literal in a lang pack: `Cargo_ARAP: '应收应付'`.
+_LANG_ENTRY_RE = re.compile(r"""^\s*([A-Za-z_][\w]*)\s*:\s*['"]([^'"]*)['"]""", re.M)
+
+# Runs of CJK characters — what a transcribed prototype must still contain if it
+# really took its copy from the product.
+_CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff][\u4e00-\u9fff，。、：；（）%\-/]*[\u4e00-\u9fff]|[\u4e00-\u9fff]")
+
+
+def _kebab_to_camel(tag: str) -> str:
+    """`booking-tree-grid` -> `bookingTreeGrid`, matching the import variable."""
+
+    head, *rest = tag.split("-")
+    return head + "".join(part[:1].upper() + part[1:] for part in rest if part)
+
+
+def _is_library_tag(tag: str) -> bool:
+    return tag.lower().startswith(_LIBRARY_PREFIXES)
+
+
+def component_imports(script: str) -> dict[str, str]:
+    """Local component imports, keyed by the variable the template binds to.
+
+    Only ``./`` and ``@/`` specifiers are kept: a package import has no readable
+    source in the mirror, so it cannot be expanded no matter how much budget is
+    left. ``@`` is the repo's ``src`` alias, which is what the Vue CLI default
+    configures and what both CARGO families use.
+    """
+
+    found: dict[str, str] = {}
+    for match in _IMPORT_RE.finditer(script or ""):
+        default_name, named, spec = match.group(1), match.group(2) or "", match.group(3)
+        if not (spec.startswith("./") or spec.startswith("@/")):
+            continue
+        if default_name:
+            found[default_name] = spec
+        for part in named.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            local = part.split(" as ")[-1].strip()
+            if local:
+                found.setdefault(local, spec)
+    return found
+
+
+def _resolve_component(root: Path, importer: str, spec: str) -> str | None:
+    """Turn an import specifier into a repo-relative file that actually exists.
+
+    The extension is usually omitted, and a directory import resolves to its
+    ``index``. Both are tried before giving up, and the answer is a relative
+    path so it can be re-read and reported without leaking absolute paths.
+    """
+
+    importer_dir = Path(importer).parent
+    if spec.startswith("@/"):
+        base = Path("src") / spec[2:]
+    else:
+        base = importer_dir / spec[2:] if spec.startswith("./") else importer_dir / spec
+    base = Path(str(base).replace("\\", "/"))
+    candidates = [base]
+    if base.suffix == "":
+        candidates += [base.with_suffix(".vue"), base.with_suffix(".jsx"), base.with_suffix(".tsx")]
+        candidates += [base / "index.vue", base / "index.js"]
+    for candidate in candidates:
+        try:
+            rel = candidate.as_posix().lstrip("./")
+        except (AttributeError, ValueError):  # pragma: no cover - defensive
+            continue
+        if (Path(root) / rel).is_file():
+            return rel
+    return None
+
+
+def read_i18n_table(root: Path) -> dict[str, str]:
+    """Flatten ``src/lang/zh*`` into ``{leaf_key: chinese_copy}``.
+
+    The CARGO pages carry no hard-coded copy at all — one page had 851 ``$t()``
+    calls and zero literal Chinese — so without this table a baseline has no
+    readable text and no way to check whether a transcription kept it. Values are
+    keyed by the *leaf* of the dotted key because the pages qualify keys with a
+    namespace (``CargoMsg.Cargo_ARAP``) that the pack file already encodes.
+    """
+
+    table: dict[str, str] = {}
+    lang_dir = Path(root) / "src" / "lang"
+    if not lang_dir.is_dir():
+        return table
+    files = [lang_dir / "zh.js"]
+    zh_dir = lang_dir / "zh_CN"
+    if zh_dir.is_dir():
+        files += sorted(zh_dir.glob("*.js"))
+    for path in files:
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:  # pragma: no cover - unreadable pack is not fatal
+            continue
+        for match in _LANG_ENTRY_RE.finditer(text):
+            leaf, value = match.group(1), match.group(2)
+            # An empty value means "not translated yet" and must not count as an
+            # anchor, otherwise the fidelity score would be measured against
+            # blanks.
+            if value.strip() and leaf not in table:
+                table[leaf] = value
+    return table
+
+
+def extract_anchor_keys(markup: str) -> set[str]:
+    """i18n keys referenced by a chunk of template."""
+
+    return set(_I18N_CALL_RE.findall(markup or ""))
+
+
+def extract_anchors(markup: str, table: dict[str, str]) -> set[str]:
+    """Chinese copy the markup is expected to show, resolved through the pack.
+
+    A key that the pack does not know is dropped rather than counted as missing:
+    an unresolved key is a gap in the language pack, not evidence that the
+    transcription lost copy.
+    """
+
+    copy: set[str] = set()
+    for key in extract_anchor_keys(markup):
+        value = table.get(key.split(".")[-1])
+        if value:
+            copy.add(value.strip())
+    # Copy that is written literally (older pages, and the admin console) is an
+    # anchor too — otherwise the whole mechanism silently measures nothing there.
+    # Comments are stripped first: the expansion markers this module writes into
+    # the template are Chinese prose, and counting them as copy inflated the
+    # anchor set with strings that never appear on a screen.
+    for run in _CJK_RUN_RE.findall(_strip_i18n_calls(_COMMENT_RE.sub(" ", markup or ""))):
+        run = run.strip()
+        if len(run) >= 2:
+            copy.add(run)
+    return copy
+
+
+def _strip_i18n_calls(markup: str) -> str:
+    return _I18N_CALL_RE.sub(" ", markup or "")
+
+
+# Everything that is markup rather than copy. `script`/`style` are removed whole
+# first, because their contents would otherwise leak identifiers into the text.
+_BLOCK_RE = re.compile(r"<(script|style)\b.*?</\1>", re.DOTALL | re.IGNORECASE)
+_TAG_ONLY_RE = re.compile(r"<[^>]+>")
+# Comments are prose, not copy. This module writes Chinese markers between the
+# spliced component templates, and a `<style>` selector or a `<!-- 新增点 -->`
+# annotation must never be counted as something the user sees.
+_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+# Attributes whose value a user reads. Anchors are collected from the raw markup,
+# so they include `placeholder="业务编号"` and `title="删除订舱"`; if the scorer
+# only looked at text nodes it would mark those as lost on a faithful
+# transcription, and the loss would be a measuring artefact rather than a defect.
+_VISIBLE_ATTR_RE = re.compile(
+    r"""(?:placeholder|title|aria-label|alt|label|empty-text)\s*=\s*["']([^"']+)["']""",
+    re.IGNORECASE,
+)
+
+
+def visible_text(markup: str) -> str:
+    """The characters a reader would see, whitespace removed.
+
+    Whitespace is stripped rather than collapsed because a transcription wraps
+    lines differently from the source; comparing with the spaces kept made every
+    long label look lost.
+    """
+
+    text = _COMMENT_RE.sub(" ", markup or "")
+    text = _BLOCK_RE.sub(" ", text)
+    attributes = " ".join(_VISIBLE_ATTR_RE.findall(text))
+    text = _TAG_ONLY_RE.sub(" ", text)
+    return re.sub(r"\s+", "", text + attributes)
+
+
+def anchor_overlap(anchors: tuple[str, ...] | list[str], markup: str) -> tuple[int, int, float]:
+    """How much of the page's own copy survived into a transcription.
+
+    ``class_overlap`` cannot judge this product: a CARGO page exposes one or two
+    class names because the interface is drawn by ag-Grid and project components,
+    so the score is either 0% or 100% depending on a single string. The copy is
+    the part that is both dense (hundreds of labels per page) and checkable —
+    every string traces back to ``src/lang/zh_CN`` through a ``$t()`` key.
+    """
+
+    pool = [a for a in (anchors or ()) if a.strip()]
+    text = visible_text(markup)
+    if not pool or not text:
+        return 0, len(pool), 0.0
+    hits = sum(1 for anchor in pool if re.sub(r"\s+", "", anchor) in text)
+    return hits, len(pool), hits / len(pool)
+
 
 @dataclass
 class SourceBaseline:
@@ -152,12 +402,32 @@ class SourceBaseline:
     classes: tuple[str, ...] = ()
     components: tuple[str, ...] = ()
     note: str = ""
+    # Sub-components whose templates were spliced into ``template``. A page whose
+    # real interface lives one level down (the usual shape in CARGO: a 1.3 KB
+    # shell wrapping a 450 KB grid) is only transcribable after this expansion,
+    # so it is recorded rather than left implicit.
+    expanded: tuple[str, ...] = ()
+    # Chinese copy the page must show, resolved through the language pack.
+    anchors: tuple[str, ...] = ()
+    # True when the located file only re-exports another page.
+    shell: bool = False
 
     @property
     def usable(self) -> bool:
         """A baseline with no template cannot be transcribed from."""
 
         return bool(self.template.strip())
+
+    @property
+    def thin(self) -> bool:
+        """True when the template is too small to describe a screen by itself.
+
+        A 1.3 KB template with one class and no copy is a container, not a page.
+        Saying so keeps the caller from labelling the result 1:1 — which is the
+        one thing the prototyping rules forbid outright.
+        """
+
+        return len(self.template) < 600 and len(self.classes) < 3 and not self.anchors
 
 
 def read_baseline(
@@ -186,14 +456,20 @@ def read_baseline(
         return SourceBaseline(page=rel, repo_key=repo_key, note=f"读取失败：{exc}")
 
     notes: list[str] = []
-    template_match = _SFC_TEMPLATE_RE.search(text)
+    template_match = template_body(text)
     if template_match is None:
-        # A .tsx/.jsx page has no SFC blocks. Handing back the raw file is still
-        # better than an empty baseline: the JSX *is* the template there.
-        notes.append("没有 <template> 块，按整文件作为基线（可能是 .tsx/.jsx）")
-        template = text
+        # A .tsx/.jsx page has no SFC blocks; there the JSX *is* the template.
+        # A .vue with no <template> is a forwarding shell — 14 lines that import
+        # another page and re-export it — and handing its `<script>` back as a
+        # template produced a baseline that scored 0% and claimed to be usable.
+        if path.suffix in {".tsx", ".jsx"}:
+            notes.append("没有 <template> 块，按整文件作为基线（.tsx/.jsx 页面）")
+            template = text
+        else:
+            notes.append("没有 <template> 块（转发壳），需沿 import 下钻到真实页面")
+            template = ""
     else:
-        template = template_match.group(1)
+        template = template_match
 
     script_match = _SFC_SCRIPT_RE.search(text)
     style_match = _SFC_STYLE_RE.search(text)
@@ -221,6 +497,236 @@ def read_baseline(
         classes=tuple(sorted(extract_classes(template))),
         components=tuple(sorted(set(_COMPONENT_TAG_RE.findall(template)))),
         note="；".join(notes),
+    )
+
+
+@dataclass
+class _ComponentSlice:
+    """One sub-component whose template was spliced into the page baseline."""
+
+    tag: str
+    rel: str
+    parent: str
+    template: str
+    depth: int
+
+
+_I18N_CACHE: dict[str, dict[str, str]] = {}
+
+
+def _cached_i18n(root: Path) -> dict[str, str]:
+    """Language pack lookup, cached per mirror root.
+
+    One page references hundreds of keys; re-reading the whole ``zh_CN`` pack for
+    every page turned a 30 ms read into a 300 ms one for no gain.
+    """
+
+    key = str(root)
+    if key not in _I18N_CACHE:
+        _I18N_CACHE[key] = read_i18n_table(root)
+    return _I18N_CACHE[key]
+
+
+def _read_text(path: Path, limit: int = 2_000_000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[:limit]
+    except OSError:
+        return ""
+
+
+def _sfc_blocks(text: str) -> tuple[str, str, str]:
+    """(template, script, style); template is "" when the file has no block."""
+
+    tpl = template_body(text)
+    scr = _SFC_SCRIPT_RE.search(text or "")
+    sty = _SFC_STYLE_RE.search(text or "")
+    return (
+        tpl if tpl is not None else "",
+        scr.group(2) if scr else "",
+        sty.group(2) if sty else "",
+    )
+
+
+def _forwarding_target(root: Path, rel: str, text: str) -> str | None:
+    """The page a template-less shell re-exports.
+
+    ``fbaBookingNew.vue`` is 14 lines: import ``bookingNew``, re-export it. Read
+    literally it has no template at all, and the previous code handed its
+    ``<script>`` back as one — a baseline that scored 0% while reporting itself
+    usable. Following the single import finds the page the user actually sees.
+    """
+
+    imports = component_imports(_sfc_blocks(text)[1])
+    if len(imports) != 1:
+        return None
+    spec = next(iter(imports.values()))
+    return _resolve_component(root, rel, spec)
+
+
+def expand_baseline(
+    repo_root: Path,
+    page_rel: str,
+    repo_key: str,
+    *,
+    max_chars: int = 40000,
+    depth: int = 3,
+    max_components: int = 40,
+) -> SourceBaseline:
+    """Read a page *and the components that actually draw it*.
+
+    Reading one SFC is not enough in this product. ``SeaExport/bookingNew.vue``
+    is 770 lines and 28 KB, but its ``<template>`` is 1361 characters holding a
+    single class and four custom tags — the screen itself lives in
+    ``booking-tree-grid`` (456 KB, 73 837 template characters) and
+    ``booking-workspace`` (352 KB), and the grid inside *that* is another
+    component again. A transcription built from the shell alone is an empty
+    frame labelled 1:1, which is exactly the fabrication the prototyping rules
+    forbid.
+
+    So the template is flattened here: local component imports are resolved
+    against the repo, their templates are read, and each one is appended behind
+    the parent with a marker naming the tag it replaces. A budget covers the
+    whole flattened result and every cut is reported — a silently truncated
+    template produces a prototype confidently missing its lower half.
+
+    The default budget is 40 000 characters rather than 24 000 because the first
+    screen of a dense page does not fit in the smaller one: at 24 000 the booking
+    grid kept a quarter of its template and yielded 30 copy anchors, which is too
+    coarse to tell a good transcription from a mediocre one.
+    """
+
+    root = Path(repo_root)
+    rel = (page_rel or "").lstrip("/")
+    if not rel:
+        return SourceBaseline(page="", repo_key=repo_key, note="没有页面路径")
+
+    notes: list[str] = []
+    text = _read_text(root / rel)
+    if not text:
+        return SourceBaseline(page=rel, repo_key=repo_key, note=f"读取失败：{rel} 不存在或不可读")
+
+    shell = False
+    if template_body(text) is None:
+        target = _forwarding_target(root, rel, text)
+        if target is None:
+            # Not a shell and not an SFC: hand it to the plain reader so the
+            # caller still gets the .tsx整文件 fallback and its own note.
+            return read_baseline(root, rel, repo_key, max_chars=max_chars)
+        notes.append(f"{rel} 是转发壳，已下钻到 {target}")
+        rel, shell = target, True
+        text = _read_text(root / rel)
+
+    template, script, style = _sfc_blocks(text)
+
+    nodes = [_ComponentSlice(tag="", rel=rel, parent="", template=template, depth=1)]
+    seen = {rel}
+    frontier: list[tuple[str, str, str, int]] = [(rel, template, script, 1)]
+    while frontier and len(nodes) < max_components:
+        cur_rel, cur_tpl, cur_script, cur_depth = frontier.pop(0)
+        if cur_depth >= depth:
+            continue
+        imports = component_imports(cur_script)
+        if not imports:
+            continue
+        for tag in sorted(set(_COMPONENT_TAG_RE.findall(cur_tpl))):
+            if _is_library_tag(tag):
+                continue
+            spec = imports.get(_kebab_to_camel(tag))
+            if spec is None:
+                continue
+            target = _resolve_component(root, cur_rel, spec)
+            if target is None or target in seen:
+                continue
+            child_tpl, child_script, _ = _sfc_blocks(_read_text(root / target))
+            if not child_tpl.strip():
+                continue
+            seen.add(target)
+            nodes.append(
+                _ComponentSlice(
+                    tag=tag, rel=target, parent=cur_rel, template=child_tpl, depth=cur_depth + 1
+                )
+            )
+            frontier.append((target, child_tpl, child_script, cur_depth + 1))
+            if len(nodes) >= max_components:
+                notes.append(f"子组件展开到上限 {max_components} 个，其余未展开")
+                break
+
+    cut: list[str] = []
+    # The screen a reviewer sees is the page plus its direct children. Everything
+    # deeper is dialogs and tab panels that are hidden until clicked, so it is
+    # expanded for the model's benefit but must not sit in the fidelity
+    # denominator: counting copy from a closed dialog made even a perfect
+    # transcription score 53%, which measures the fixture rather than the work.
+    core = [node for node in nodes[1:] if node.depth <= 2]
+    deep = [node for node in nodes[1:] if node.depth > 2]
+    core_text: list[str] = []
+    if len(nodes) == 1:
+        body = template
+        if len(body) > max_chars:
+            notes.append(f"template 从 {len(body)} 字截到 {max_chars} 字")
+            body = body[:max_chars]
+        flattened = body
+        core_text.append(body)
+    else:
+        reserve = min(len(template), max(1500, max_chars // 4))
+        rest = max(max_chars - reserve, 0)
+        # First-screen components get the lion's share of what is left; the
+        # hidden ones take what remains so they still inform the structure.
+        budgets = {id(node): 0 for node in nodes[1:]}
+        for group, budget in ((core, int(rest * 0.72)), (deep, rest - int(rest * 0.72))):
+            total_g = sum(len(node.template) for node in group) or 1
+            for node in group:
+                budgets[id(node)] = min(
+                    len(node.template), max(300, int(budget * len(node.template) / total_g))
+                )
+        if len(template) > reserve:
+            notes.append(f"主模板从 {len(template)} 字截到 {reserve} 字")
+        parts = [template[:reserve]]
+        core_text.append(template[:reserve])
+        for node in nodes[1:]:
+            size = len(node.template)
+            share = budgets[id(node)]
+            if share < size:
+                cut.append(node.rel)
+            block = (
+                f"\n<!-- [子组件展开] <{node.tag}> → {node.rel}（该组件模板 {size} 字"
+                f"{'，已按预算截断' if share < size else ''}"
+                f"{'，位于弹窗/标签页内，非首屏' if node.depth > 2 else ''}）"
+                f"\n     主模板里出现 <{node.tag}> 的位置，真实页面渲染的就是下面这段结构： -->\n"
+                f"{node.template[:share]}\n<!-- [/子组件展开] <{node.tag}> -->\n"
+            )
+            parts.append(block)
+            if node.depth <= 2:
+                core_text.append(node.template[:share])
+        flattened = "".join(parts)
+        if cut:
+            notes.append(f"{len(cut)} 个子组件模板按预算截断（例如 {cut[0]}）")
+
+    # Anchors come from the first screen only, so the score answers "did the
+    # transcription keep the screen" rather than "did it also reproduce every
+    # dialog behind a click".
+    anchors = extract_anchors("\n".join(core_text), _cached_i18n(root))
+    if len(nodes) > 1:
+        notes.append(f"已展开 {len(nodes) - 1} 个子组件：{'、'.join(n.tag for n in nodes[1:5])}"
+                     + ("…" if len(nodes) > 5 else ""))
+        notes.append(f"保真度只按首屏 {len(core)} 个子组件计分，弹窗/标签页内的文案不计入分母")
+    if anchors:
+        notes.append(f"首屏业务文案锚点 {len(anchors)} 条（经语言包反查）")
+
+    return SourceBaseline(
+        page=rel,
+        repo_key=repo_key,
+        template=flattened,
+        script=script[:8000],
+        style=style[:8000],
+        size=len(text.encode("utf-8", errors="replace")),
+        lines=text.count("\n") + 1,
+        classes=tuple(sorted(extract_classes(flattened))),
+        components=tuple(sorted({n.tag for n in nodes if n.tag})),
+        note="；".join(notes),
+        expanded=tuple(n.rel for n in nodes[1:]),
+        anchors=tuple(sorted(anchors)),
+        shell=shell,
     )
 
 
@@ -394,8 +900,8 @@ def _read(path: Path, limit: int = 400_000) -> str:
 
 
 def _template_of(sfc: str) -> str:
-    match = _SFC_TEMPLATE_RE.search(sfc or "")
-    return match.group(1) if match else ""
+    body = template_body(sfc or "")
+    return body if body is not None else ""
 
 
 def _collect_css(

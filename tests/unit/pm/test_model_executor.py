@@ -276,7 +276,9 @@ def test_a_transcription_that_drops_the_structure_is_flagged_not_passed_off() ->
     assert out.artifact["origin"] == "source"
     assert out.artifact["fidelity"] == "partial"
     assert out.artifact["source_repo"]["class_overlap"] == 0.0
-    assert any("class 留存率" in gap for gap in out.gaps)
+    # Nothing of the source survived, so there is no basis to score — and the gap
+    # says that outright instead of quoting a ratio that measures nothing.
+    assert any("保真度未量化" in gap or "低于 1:1 阈值" in gap for gap in out.gaps)
 
 
 def test_decision_returns_a_card_not_an_artifact() -> None:

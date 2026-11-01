@@ -33,7 +33,7 @@ from octop.infra.pm.runtime.executor import (
     StepOutput,
 )
 from octop.infra.pm.runtime.prototype_derive import DerivationOutcome, derive_from_source
-from octop.infra.pm.runtime.prototype_source import extract_classes
+from octop.infra.pm.runtime.prototype_source import anchor_overlap, extract_classes
 
 MODEL_STEPS: tuple[str, ...] = (
     "link_expand",
@@ -958,6 +958,15 @@ class ModelStepExecutor:
             blocks += ["【script 原文 —— 只看它绑了哪些字段与状态，不要照抄逻辑】", baseline.script]
         if baseline.style:
             blocks += ["【style 原文 —— 只看间距、字号与颜色】", baseline.style]
+        if baseline.anchors:
+            # The template carries `$t('CargoMsg.Cargo_ARAP')`, not 应收应付 — the
+            # repo has no hard-coded Chinese at all. Without the resolved list the
+            # model would invent its own labels and the copy score would be zero
+            # for a reason that has nothing to do with fidelity.
+            blocks += [
+                "【本页真实业务文案 —— 经语言包反查，转写时必须原样使用这些词】",
+                "、".join(baseline.anchors[:120]),
+            ]
         source_block = "\n".join(blocks)
 
         raw = self._ask(
@@ -989,8 +998,19 @@ class ModelStepExecutor:
                 f"prototype has fewer than two element kinds after cleanup: {kinds}"
             )
 
-        # Local, dependency-free fidelity measurement: how much of the page's own
-        # class vocabulary survived into the transcription.
+        # Fidelity is measured on the copy, not primarily on the class list.
+        #
+        # `class_overlap` works for a page built from an Element UI form: dozens
+        # of `el-*` names to compare, so the ratio means something. It does not
+        # work for the CARGO booking page, whose three flattened layers expose
+        # seven class names in total because the interface is drawn by ag-Grid —
+        # a ratio with a one-element denominator is 0% or 100% by accident, and
+        # calling that "1:1" is precisely the fabrication the rules forbid.
+        #
+        # Every string the product shows is a `$t()` key resolved by the language
+        # pack, so the copy is dense (623 resolvable labels on that page) and
+        # each one traces back to a file. That is the number the gate reads.
+        copy_hits, copy_total, copy_rate = anchor_overlap(baseline.anchors, html)
         written = extract_classes(html)
         source_classes = set(baseline.classes)
         overlap = (
@@ -999,20 +1019,47 @@ class ModelStepExecutor:
         missing = sorted(source_classes - written)[:8]
         anchor = f"{baseline.repo_key}/{baseline.page}"
 
-        if overlap >= 0.7:
-            fidelity = "exact"
-            verdict = f"按 {baseline.page} 的模板转写，class 留存 {overlap:.0%}"
-        elif overlap >= 0.4:
+        # A page with neither dense copy nor a real class vocabulary cannot be
+        # measured at all. Saying so is more useful than printing a number that
+        # only looks like a measurement.
+        #
+        # Measurability is judged on the number of *hits*, not the size of the
+        # denominator: a page with one class scores 100% the moment the model
+        # repeats that one string, which is a coincidence rather than evidence.
+        copy_measurable = copy_total >= 20
+        class_hits = len(written & source_classes)
+        class_measurable = class_hits >= 3
+        if copy_measurable:
+            rate, basis = copy_rate, "文案"
+            detail = f"文案留存 {copy_hits}/{copy_total}（{copy_rate:.0%}）"
+        elif class_measurable:
+            rate, basis = overlap, "class"
+            detail = f"class 留存 {overlap:.0%}（{len(source_classes)} 个 class）"
+        else:
+            rate, basis, detail = 0.0, "无", (
+                f"本页只有 {len(source_classes)} 个 class、{copy_total} 条可反查文案，"
+                "没有可量化的保真度依据"
+            )
+
+        if basis == "无":
             fidelity = "partial"
-            verdict = f"按 {baseline.page} 的模板转写，但只留存 {overlap:.0%} 的 class，部分结构被改写"
+            verdict = f"以 {baseline.page} 为基线转写，但{detail}，不能宣称 1:1"
+        elif rate >= 0.7:
+            fidelity = "exact"
+            verdict = f"按 {baseline.page} 的模板转写，{detail}"
+        elif rate >= 0.4:
+            fidelity = "partial"
+            verdict = f"按 {baseline.page} 的模板转写，但只留存 {rate:.0%} 的{basis}，部分结构被改写"
         else:
             fidelity = "partial"
             verdict = (
-                f"虽以 {baseline.page} 为基线，但 class 只留存 {overlap:.0%}，"
+                f"虽以 {baseline.page} 为基线，但{basis}只留存 {rate:.0%}，"
                 "很可能没按原文结构复刻，需人工核对"
             )
 
         notes = [verdict]
+        if baseline.expanded:
+            notes.append(f"页面壳下展开了 {len(baseline.expanded)} 个子组件才得到完整结构")
         if baseline.note:
             notes.append(baseline.note)
         if outcome.reason:
@@ -1037,18 +1084,22 @@ class ModelStepExecutor:
                     "lines": f"1-{baseline.lines}",
                 },
                 excerpt=(
-                    f"{anchor} 共 {baseline.lines} 行，模板含 {len(baseline.classes)} 个 class、"
-                    f"{len(baseline.components)} 类组件；转写后 class 留存 {overlap:.0%}"
+                    f"{anchor} 共 {baseline.lines} 行，展开 {len(baseline.expanded)} 个子组件后的模板含 "
+                    f"{len(baseline.classes)} 个 class、{copy_total} 条业务文案；转写后{detail}"
                 ),
-                confidence=0.9 if overlap >= 0.7 else 0.65,
+                confidence=0.9 if basis != "无" and rate >= 0.7 else 0.65,
             ),
         ]
 
         gaps: list[str] = []
-        if overlap < 0.7:
+        if basis == "无":
             gaps.append(
-                f"class 留存率 {overlap:.0%}，低于 1:1 阈值 70%；"
-                f"请对照 {anchor} 逐块核对"
+                f"{anchor} 没有足够的可比对锚点，保真度未量化；"
+                "请人工对照源码逐块核对后再标注 1:1"
+            )
+        elif rate < 0.7:
+            gaps.append(
+                f"{basis}留存率 {rate:.0%}，低于 1:1 阈值 70%；请对照 {anchor} 逐块核对"
             )
         if outcome.location.ambiguous:
             shortlist = "、".join(item.source_file for item in outcome.location.candidates[:3])
@@ -1074,14 +1125,17 @@ class ModelStepExecutor:
                     "page": baseline.page,
                     "class_overlap": round(overlap, 3),
                     "classes_source": len(source_classes),
+                    "copy_overlap": round(copy_rate, 3),
+                    "copy_anchors": copy_total,
+                    "expanded_components": len(baseline.expanded),
                     "page_ambiguous": outcome.location.ambiguous,
                 },
             },
             conclusions=[
                 {
                     "text": (
-                        f"原型按 {anchor} 的 template 转写，class 留存 {overlap:.0%}"
-                        f"（源 {len(source_classes)} 个）。"
+                        f"原型按 {anchor} 的 template 转写，{detail}"
+                        f"（源 {len(source_classes)} 个 class、{len(baseline.expanded)} 个展开子组件）。"
                     ),
                     "status": "evidenced",
                     "evidence_indexes": [1],

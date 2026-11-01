@@ -44,7 +44,7 @@ from octop.infra.pm.runtime.prototype_source import (
     PrototypeDeriver,
     SourceBaseline,
     SsrRenderer,
-    read_baseline,
+    expand_baseline,
 )
 
 # The renderer ships inside the wheel so `pip install` alone enables derivation.
@@ -805,12 +805,26 @@ def derive_from_source(
             reason=location.notes[0] if location.notes else "未能在源码仓库中定位到对应页面",
         )
 
-    baseline = read_baseline(root, location.page, spec.key)
+    # Read the page *and* the components that draw it. One SFC is not enough in
+    # this product: the located file is frequently a 1.3 KB frame around a 450 KB
+    # grid, and a baseline taken from the frame alone transcribes to an empty
+    # screen while still claiming to be derived.
+    baseline = expand_baseline(root, location.page, spec.key)
     if not baseline.usable:
         return DerivationOutcome(
             ok=False,
             location=location,
             reason=f"页面 {location.page} 没有可复刻的内容：{baseline.note or '模板为空'}",
+        )
+    if baseline.thin:
+        return DerivationOutcome(
+            ok=False,
+            location=location,
+            reason=(
+                f"页面 {location.page} 展开 {len(baseline.expanded)} 个子组件后仍只有 "
+                f"{len(baseline.template)} 字模板、{len(baseline.classes)} 个 class，"
+                "不足以复刻界面（界面可能由运行时配置渲染）"
+            ),
         )
 
     if not verify:
