@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Alert, Button, Checkbox, Divider, Input, Modal, Spin, Tag } from "antd";
+import { Alert, Button, Checkbox, Divider, Input, Modal, Spin, Tabs, Tag } from "antd";
 import { Link2, RefreshCw, Search } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { pmApi } from "../../../api/modules/pm";
@@ -12,12 +12,15 @@ import type {
 } from "../../../api/types";
 import { apiErrorMessage } from "../../../utils/apiError";
 import { message } from "../../../utils/antdMessage";
+import JiraConnectorPicker from "./JiraConnectorPicker";
 
 interface NewRequirementModalProps {
   open: boolean;
   workspaceId: number | null;
   onClose: () => void;
   onCreated: (requirement: PmRequirement) => void;
+  /** Only used by the empty connector picker: "go install one first". */
+  onOpenConnectors?: () => void;
 }
 
 /**
@@ -39,6 +42,7 @@ export default function NewRequirementModal({
   workspaceId,
   onClose,
   onCreated,
+  onOpenConnectors,
 }: NewRequirementModalProps) {
   const { t } = useTranslation();
 
@@ -63,6 +67,10 @@ export default function NewRequirementModal({
   const [submitting, setSubmitting] = useState(false);
 
   const [showConfig, setShowConfig] = useState(false);
+  // Connector first: the site URL and token are already inside one, so making
+  // an operator retype them is asking for a second copy of a secret that will
+  // then drift. The REST form stays one click away for installs without one.
+  const [configMode, setConfigMode] = useState<"connector" | "rest">("connector");
   const [baseUrl, setBaseUrl] = useState("");
   const [token, setToken] = useState("");
   const [jql, setJql] = useState("");
@@ -87,6 +95,9 @@ export default function NewRequirementModal({
       setBaseUrl(next.base_url || "");
       setJql(next.jql || "");
       setVerifyTls(next.verify_tls);
+      // Nothing configured: open straight onto the fix. Which tab that fix uses
+      // is decided once, in the reset effect, so a refresh cannot yank the
+      // operator out of the tab they chose.
       setShowConfig(!next.configured);
     } catch (err) {
       setConfigError(apiErrorMessage(err, t("pm.newRequirement.loadFailed"), t));
@@ -172,6 +183,7 @@ export default function NewRequirementModal({
     setMeta(null);
     setConfigError(null);
     setToken("");
+    setConfigMode("connector");
     setReloadKey((value) => value + 1);
     void refreshStatus();
     void loadMeta();
@@ -269,61 +281,104 @@ export default function NewRequirementModal({
         {statusLoading ? <Spin size="small" /> : null}
 
         {showConfig ? (
-          <div data-testid="pm-jira-config" style={{ display: "grid", gap: 10 }}>
-            <Alert type="info" showIcon message={t("pm.jira.intro")} />
-            <label style={{ display: "grid", gap: 4 }}>
-              <span style={{ fontSize: 12 }}>{t("pm.jira.baseUrl")}</span>
-              <Input
-                value={baseUrl}
-                onChange={(event) => setBaseUrl(event.target.value)}
-                placeholder="https://jira.example.com"
-                autoComplete="off"
-              />
-              <span style={{ fontSize: 11, opacity: 0.6 }}>{t("pm.jira.baseUrlHint")}</span>
-            </label>
-            <label style={{ display: "grid", gap: 4 }}>
-              <span style={{ fontSize: 12 }}>{t("pm.jira.token")}</span>
-              <Input.Password
-                value={token}
-                onChange={(event) => setToken(event.target.value)}
-                placeholder={status?.token_set ? t("pm.jira.tokenKeep") : t("pm.jira.tokenHint")}
-                autoComplete="new-password"
-              />
-              <span style={{ fontSize: 11, opacity: 0.6 }}>{t("pm.jira.tokenHint")}</span>
-            </label>
-            <label style={{ display: "grid", gap: 4 }}>
-              <span style={{ fontSize: 12 }}>{t("pm.jira.jql")}</span>
-              <Input
-                value={jql}
-                onChange={(event) => setJql(event.target.value)}
-                placeholder={meta?.jql || "assignee = currentUser() AND status in (\"待设计\")"}
-              />
-              <span style={{ fontSize: 11, opacity: 0.6 }}>{t("pm.jira.jqlHint")}</span>
-            </label>
-            <Checkbox
-              checked={verifyTls}
-              onChange={(event) => setVerifyTls(event.target.checked)}
-            >
-              {t("pm.jira.verifyTls")}
-            </Checkbox>
-            {configError ? <Alert type="error" showIcon message={configError} /> : null}
-            <div>
-              <Button
-                type="primary"
-                size="small"
-                icon={<Link2 size={13} />}
-                loading={connecting}
-                disabled={!baseUrl.trim() || (!token.trim() && !status?.token_set)}
-                onClick={() => void connect()}
-              >
-                {t("pm.jira.connect")}
+          <div data-testid="pm-jira-config">
+            <Tabs
+              size="small"
+              activeKey={configMode}
+              onChange={(key) => setConfigMode(key as "connector" | "rest")}
+              items={[
+                {
+                  key: "connector",
+                  label: t("pm.jira.tabConnector"),
+                  children: (
+                    <JiraConnectorPicker
+                      workspaceId={workspaceId}
+                      status={status}
+                      onBound={(next) => {
+                        // The bound connector is authoritative: take its status
+                        // as returned rather than re-deriving it here.
+                        setStatus(next);
+                        setShowConfig(false);
+                        void loadMeta();
+                      }}
+                      onUseRest={() => setConfigMode("rest")}
+                      onOpenConnectors={onOpenConnectors}
+                    />
+                  ),
+                },
+                {
+                  key: "rest",
+                  label: t("pm.jira.tabRest"),
+                  children: (
+                    <div style={{ display: "grid", gap: 10 }}>
+                      <label style={{ display: "grid", gap: 4 }}>
+                        <span style={{ fontSize: 12 }}>{t("pm.jira.baseUrl")}</span>
+                        <Input
+                          value={baseUrl}
+                          onChange={(event) => setBaseUrl(event.target.value)}
+                          placeholder="https://jira.example.com"
+                          autoComplete="off"
+                        />
+                        <span style={{ fontSize: 11, opacity: 0.6 }}>
+                          {t("pm.jira.baseUrlHint")}
+                        </span>
+                      </label>
+                      <label style={{ display: "grid", gap: 4 }}>
+                        <span style={{ fontSize: 12 }}>{t("pm.jira.token")}</span>
+                        <Input.Password
+                          value={token}
+                          onChange={(event) => setToken(event.target.value)}
+                          placeholder={
+                            status?.token_set ? t("pm.jira.tokenKeep") : t("pm.jira.tokenHint")
+                          }
+                          autoComplete="new-password"
+                        />
+                        <span style={{ fontSize: 11, opacity: 0.6 }}>
+                          {t("pm.jira.tokenHint")}
+                        </span>
+                      </label>
+                      <label style={{ display: "grid", gap: 4 }}>
+                        <span style={{ fontSize: 12 }}>{t("pm.jira.jql")}</span>
+                        <Input
+                          value={jql}
+                          onChange={(event) => setJql(event.target.value)}
+                          placeholder={
+                            meta?.jql || 'assignee = currentUser() AND status in ("待设计")'
+                          }
+                        />
+                        <span style={{ fontSize: 11, opacity: 0.6 }}>
+                          {t("pm.jira.jqlHint")}
+                        </span>
+                      </label>
+                      <Checkbox
+                        checked={verifyTls}
+                        onChange={(event) => setVerifyTls(event.target.checked)}
+                      >
+                        {t("pm.jira.verifyTls")}
+                      </Checkbox>
+                      {configError ? <Alert type="error" showIcon message={configError} /> : null}
+                      <div>
+                        <Button
+                          type="primary"
+                          size="small"
+                          icon={<Link2 size={13} />}
+                          loading={connecting}
+                          disabled={!baseUrl.trim() || (!token.trim() && !status?.token_set)}
+                          onClick={() => void connect()}
+                        >
+                          {t("pm.jira.connect")}
+                        </Button>
+                      </div>
+                    </div>
+                  ),
+                },
+              ]}
+            />
+            {configured ? (
+              <Button size="small" onClick={() => setShowConfig(false)}>
+                {t("pm.actions.cancel")}
               </Button>
-              {configured ? (
-                <Button size="small" style={{ marginLeft: 8 }} onClick={() => setShowConfig(false)}>
-                  {t("pm.actions.cancel")}
-                </Button>
-              ) : null}
-            </div>
+            ) : null}
           </div>
         ) : (
           <>
@@ -365,6 +420,11 @@ export default function NewRequirementModal({
                 {query ? t("pm.newRequirement.searching", { q: query }) : t("pm.newRequirement.queueHint")}
               </span>
               {meta?.user ? <Tag color="blue" style={{ fontSize: 10 }}>{meta.user}</Tag> : null}
+              {status?.transport === "mcp" && status.connector_display ? (
+                <Tag color="purple" style={{ fontSize: 10 }} data-testid="pm-jira-connector-tag">
+                  {status.connector_display}
+                </Tag>
+              ) : null}
               {status?.base_url ? <Tag style={{ fontSize: 10 }}>{status.base_url}</Tag> : null}
               <Button type="link" size="small" onClick={() => setShowConfig(true)}>
                 {t("pm.jira.reconfigure")}

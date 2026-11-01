@@ -348,13 +348,42 @@ export interface PmJiraIssuePreview {
 
 export interface PmJiraStatus {
   configured: boolean;
+  /**
+   * How this workspace reaches Jira.
+   *
+   * `mcp` means the site URL and token live in a connector the operator already
+   * installed, so nothing is stored here and `token_set` only says "the
+   * connector is alive". `rest` keeps the older site+token row.
+   */
+  transport: "mcp" | "rest";
   base_url: string;
   jql: string;
   verify_tls: boolean;
   token_set: boolean;
+  auth?: string;
+  /** Present on the `mcp` transport: which connector, never its credential. */
+  connector_instance_id?: string;
+  connector_server?: string;
+  connector_display?: string;
   enabled: boolean;
   last_probe_at: string | null;
   probe_status: string | null;
+}
+
+/**
+ * A connector that already carries a Jira server, i.e. one worth binding.
+ *
+ * The list is filtered server-side: picking a mail connector would fail on the
+ * first query with a message that points at the tool rather than the choice.
+ */
+export interface PmJiraConnector {
+  instance_id: string;
+  display_name: string;
+  status: string;
+  server_key: string;
+  server_display: string;
+  base_url: string;
+  username: string;
 }
 
 /**

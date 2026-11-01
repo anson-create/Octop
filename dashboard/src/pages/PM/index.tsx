@@ -435,6 +435,7 @@ export default function PMPage() {
         open={newOpen}
         workspaceId={workspaceId}
         onClose={() => setNewOpen(false)}
+        onOpenConnectors={() => navigate("/connectors")}
         onCreated={(requirement) => {
           void requirements.refresh();
           navigate(`/pm/requirements/${requirement.id}`);

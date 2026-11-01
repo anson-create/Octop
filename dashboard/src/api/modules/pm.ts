@@ -10,6 +10,7 @@ import type {
   PmIntegration,
   PmJiraIssue,
   PmJiraIssuePreview,
+  PmJiraConnector,
   PmJiraMeta,
   PmJiraStatus,
   PmMetricRow,
@@ -106,6 +107,19 @@ export const pmApi = {
   getJiraIssue: (workspaceId: number, issueKey: string) =>
     request<PmJiraIssuePreview>(
       `/pm/jira/issue/${encodeURIComponent(issueKey)}${qs({ workspace_id: workspaceId })}`,
+    ),
+  // Connectors that already carry a Jira server. Binding one stores *which*
+  // connector, never the credential: the site URL and token keep living in the
+  // connector, so rotating them there rotates them here too.
+  jiraConnectors: () =>
+    request<{ items: PmJiraConnector[]; total: number }>("/pm/jira/connectors"),
+  bindJiraConnector: (
+    workspaceId: number,
+    body: { connector_instance_id: string; server_key?: string; jql?: string },
+  ) =>
+    request<PmJiraStatus>(
+      `/pm/jira/bind-connector${qs({ workspace_id: workspaceId })}`,
+      json(body),
     ),
 
   // --- workspaces ---------------------------------------------------------

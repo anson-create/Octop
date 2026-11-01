@@ -647,7 +647,20 @@
       "connected": "Connected: {{user}}",
       "connectFailed": "Connection failed",
       "configured": "Jira connected",
-      "reconfigure": "Reconfigure"
+      "reconfigure": "Reconfigure",
+      "tabConnector": "Use a connected connector",
+      "tabRest": "Site + token",
+      "usingConnector": "Going through connector: {{name}} — the site URL and token live in the connector, not here.",
+      "noConnector": "No Jira connector available",
+      "noConnectorHint": "Install an MCP connector that carries Jira (Atlassian MCP, for example) on the Connectors page, then come back and pick it here.",
+      "openConnectors": "Open connectors",
+      "bindConnector": "Use this connector",
+      "connectorBound": "Switched to that connector's Jira",
+      "connectorBindFailed": "Could not bind the connector",
+      "connectorLoadFailed": "Could not load connectors",
+      "currentConnector": "In use",
+      "useRest": "Use a site + token instead",
+      "connectorHint": "Only which connector is recorded, never the token: rotate it in the connector and it rotates here."
     },
     "reflow": {
       "title": "Re-flow from a step",

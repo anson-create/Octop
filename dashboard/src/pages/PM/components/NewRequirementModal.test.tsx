@@ -2,15 +2,23 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { jiraStatus, jiraMeta, listJiraIssues, getJiraIssue, createRequirement } = vi.hoisted(
-  () => ({
-    jiraStatus: vi.fn(),
-    jiraMeta: vi.fn(),
-    listJiraIssues: vi.fn(),
-    getJiraIssue: vi.fn(),
-    createRequirement: vi.fn(),
-  }),
-);
+const {
+  jiraStatus,
+  jiraMeta,
+  listJiraIssues,
+  getJiraIssue,
+  createRequirement,
+  jiraConnectors,
+  bindJiraConnector,
+} = vi.hoisted(() => ({
+  jiraStatus: vi.fn(),
+  jiraMeta: vi.fn(),
+  listJiraIssues: vi.fn(),
+  getJiraIssue: vi.fn(),
+  createRequirement: vi.fn(),
+  jiraConnectors: vi.fn(),
+  bindJiraConnector: vi.fn(),
+}));
 
 vi.mock("../../../api/modules/pm", () => ({
   pmApi: {
@@ -19,6 +27,8 @@ vi.mock("../../../api/modules/pm", () => ({
     listJiraIssues,
     getJiraIssue,
     createRequirement,
+    jiraConnectors,
+    bindJiraConnector,
     saveJiraConfig: vi.fn(() => Promise.resolve({ configured: true })),
     probeJira: vi.fn(() => Promise.resolve({ user: "tester" })),
   },
@@ -85,9 +95,20 @@ const META = {
   error: "",
 };
 
-function stubStatus(configured = true) {
+const CONNECTOR = {
+  instance_id: "01M6B8GYSNE634YEHG5HB51R47",
+  display_name: "Jira + Confluence (WallTech)",
+  status: "active",
+  server_key: "atlassian",
+  server_display: "Atlassian MCP",
+  base_url: "https://walltech.atlassian.net",
+  username: "anson",
+};
+
+function stubStatus(configured = true, transport: "rest" | "mcp" = "rest") {
   jiraStatus.mockResolvedValue({
     configured,
+    transport,
     base_url: configured ? "https://jira.example.com" : "",
     jql: "",
     verify_tls: true,
@@ -95,6 +116,9 @@ function stubStatus(configured = true) {
     enabled: configured,
     last_probe_at: null,
     probe_status: null,
+    connector_instance_id: transport === "mcp" ? CONNECTOR.instance_id : undefined,
+    connector_server: transport === "mcp" ? CONNECTOR.server_key : undefined,
+    connector_display: transport === "mcp" ? CONNECTOR.display_name : undefined,
   });
 }
 
@@ -106,10 +130,15 @@ function renderModal(
     meta?: Partial<typeof META>;
     items?: (typeof ISSUE)[];
     note?: string;
+    connectors?: (typeof CONNECTOR)[];
   } = {},
 ) {
   stubStatus(overrides.configured ?? true);
   jiraMeta.mockResolvedValue({ ...META, ...overrides.meta });
+  jiraConnectors.mockResolvedValue({
+    items: overrides.connectors ?? [CONNECTOR],
+    total: (overrides.connectors ?? [CONNECTOR]).length,
+  });
   listJiraIssues.mockResolvedValue({
     jql: META.jql,
     items: overrides.items ?? [ISSUE],
@@ -297,5 +326,67 @@ describe("NewRequirementModal", () => {
     // a connection error that looks like a bad ticket number.
     expect(screen.queryByTestId("pm-jira-search")).toBeNull();
     expect(listJiraIssues).not.toHaveBeenCalled();
+  });
+
+  it("offers the connector that already holds the credential, not a token box", async () => {
+    renderModal({ configured: false });
+
+    // The site URL and token were entered once, when the connector was
+    // installed. Asking for them again creates a second copy that drifts.
+    expect(await screen.findByTestId("pm-jira-connectors")).toBeInTheDocument();
+    expect(await screen.findByText(CONNECTOR.display_name)).toBeInTheDocument();
+    expect(document.querySelector('input[type="password"]')).toBeNull();
+  });
+
+  it("binds the picked connector and opens the queue without a token", async () => {
+    const user = userEvent.setup();
+    renderModal({ configured: false });
+
+    // Installed before the click: the bind is awaited, so a reply set later
+    // would arrive after the dialog had already consumed undefined.
+    bindJiraConnector.mockResolvedValue({
+      configured: true,
+      transport: "mcp",
+      base_url: CONNECTOR.base_url,
+      jql: "",
+      verify_tls: true,
+      token_set: true,
+      enabled: true,
+      last_probe_at: null,
+      probe_status: null,
+      connector_instance_id: CONNECTOR.instance_id,
+      connector_server: CONNECTOR.server_key,
+      connector_display: CONNECTOR.display_name,
+    });
+
+    const row = await waitFor(() => {
+      const found = document.querySelector(
+        `[data-connector-key="${CONNECTOR.instance_id}:${CONNECTOR.server_key}"]`,
+      );
+      if (!found) throw new Error("connector row not rendered");
+      return found as HTMLElement;
+    });
+    await user.click(row);
+    await user.click(screen.getByTestId("pm-jira-bind"));
+
+    await waitFor(() =>
+      expect(bindJiraConnector).toHaveBeenCalledWith(1, {
+        connector_instance_id: CONNECTOR.instance_id,
+        server_key: CONNECTOR.server_key,
+      }),
+    );
+
+    // The reply is the new status, so the queue opens on it: binding is the
+    // whole configuration step, there is nothing else to fill in.
+    await waitFor(() => expect(listJiraIssues).toHaveBeenCalled());
+    expect(screen.queryByTestId("pm-jira-config")).toBeNull();
+  });
+
+  it("says where to install a connector when the site has none", async () => {
+    renderModal({ configured: false, connectors: [] });
+
+    // An empty picker with no next step is a dead end; name the page instead.
+    expect(await screen.findByTestId("pm-jira-connectors-empty")).toBeInTheDocument();
+    expect(screen.getByText("pm.jira.openConnectors")).toBeInTheDocument();
   });
 });

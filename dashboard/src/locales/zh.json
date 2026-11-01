@@ -647,7 +647,20 @@
       "connected": "已连接：{{user}}",
       "connectFailed": "连接失败",
       "configured": "Jira 已连接",
-      "reconfigure": "重新配置"
+      "reconfigure": "重新配置",
+      "tabConnector": "用已连接的连接器",
+      "tabRest": "站点 + Token",
+      "usingConnector": "当前走连接器：{{name}} —— 站点地址和 token 都在连接器里，这里不存第二份。",
+      "noConnector": "没有可用的 Jira 连接器",
+      "noConnectorHint": "先到「连接器」页安装一个带 Jira 的 MCP 连接器（例如 Atlassian MCP），装好回到这里就能直接选。",
+      "openConnectors": "去连接器页",
+      "bindConnector": "使用此连接器",
+      "connectorBound": "已切换到该连接器的 Jira",
+      "connectorBindFailed": "绑定连接器失败",
+      "connectorLoadFailed": "读取连接器列表失败",
+      "currentConnector": "当前使用",
+      "useRest": "改用站点 + Token 连接",
+      "connectorHint": "只记录用哪个连接器，不复制 token：在连接器里换 token，这里自动跟着换。"
     },
     "reflow": {
       "title": "从某环节重跑",
