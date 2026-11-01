@@ -245,8 +245,48 @@ def test_the_vue2_renderer_renders_once_a_toolchain_is_present(tmp_path: Path) -
     assert result.ok is True
     assert "page-container" in result.html
     assert "vue:2.6.10" in result.components
-    assert "element-ui:global" in result.components
+    # This mirror has no `node_modules`, so Element UI can only arrive through
+    # the module graph — the fallback route, labelled as such.
+    assert "element-ui:ssr" in result.components
     assert "plugin:vite-plugin-vue2" in result.components
+
+
+def test_element_ui_skips_vite_when_the_mirror_carries_a_real_package(tmp_path: Path) -> None:
+    """The production route has to be the native one.
+
+    Vite 2 evaluates every module as ESM, so a CommonJS `element-ui` loaded
+    through it dies with "module is not defined" and every `el-*` tag renders as
+    an unknown element — a prototype that looks structurally right and is
+    quietly wrong. This pins the preference: when the mirror has the package,
+    it is required by Node, and the result says so.
+    """
+
+    from octop.infra.pm.runtime.prototype_derive import ensure_render_script
+
+    tool = tmp_path / "toolchain"
+    tool.mkdir()
+    script = ensure_render_script(tool, "render.vue2.mjs")
+    assert script is not None
+    _write_tree(tool / "node_modules", _TOOLCHAIN)
+
+    mirror = tmp_path / "mirror-with-deps"
+    (mirror / "src/views").mkdir(parents=True)
+    (mirror / "package.json").write_text('{"name":"mirror"}', encoding="utf-8")
+    _write_tree(
+        mirror / "node_modules",
+        {
+            "element-ui/package.json": '{"name":"element-ui","main":"index.js"}',
+            "element-ui/index.js": (
+                "module.exports = { install: function (Vue) { Vue.__elementUi = true } };\n"
+            ),
+        },
+    )
+
+    result = SsrRenderer(script, timeout_s=60).render(mirror, "src/views/x.vue")
+
+    assert result.ok is True
+    assert "element-ui:native" in result.components
+    assert "element-ui:ssr" not in result.components
 
 
 def test_derivation_failure_never_claims_exact_fidelity(tmp_path: Path) -> None:

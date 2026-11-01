@@ -79,6 +79,40 @@ async function loadOwn(name) {
 }
 
 /**
+ * A `require` rooted at the mirror, for packages that must load as CommonJS.
+ *
+ * Resolving against the mirror's own `package.json` — not this script's
+ * directory — is what keeps Element UI on the product's version instead of
+ * whatever the toolchain happens to carry.
+ */
+function mirrorRequire() {
+  return createRequire(join(root, 'package.json'))
+}
+
+/**
+ * Load a CommonJS package, preferring Node's own loader.
+ *
+ * Native `require` is what works on Vite 2, whose dev SSR has no CJS interop
+ * (see the Element UI block). The Vite path is kept as a fallback because a
+ * mirror that reshapes these packages — a Vue 2.7 build, a bundler shim — may
+ * only be reachable through the module graph, and reporting which route was
+ * taken is cheaper than guessing when a page renders wrong.
+ */
+async function loadCommonJS(vite, name) {
+  let nativeError = null
+  try {
+    return { mod: mirrorRequire()(name), via: 'native' }
+  } catch (err) {
+    nativeError = err
+  }
+  try {
+    return { mod: await vite.ssrLoadModule(name), via: 'ssr' }
+  } catch {
+    throw nativeError
+  }
+}
+
+/**
  * Define a global that modern Node may already own as a read-only accessor.
  *
  * Node 22 exposes `navigator` as a getter-only property; a plain assignment
@@ -237,19 +271,47 @@ async function main() {
 
   // Vue 2's SFC plugin has shipped under two names; the toolchain installs one
   // of them and this reports which, rather than hard-coding a guess.
+  //
+  // Both are CommonJS. Dynamic `import()` of a CJS module hands back
+  // `{ default: module.exports }`, and when the module itself was transpiled
+  // from ESM the function sits one level deeper again — `{ default: { default:
+  // fn } }`. Peeling exactly one layer is what produced "vue2plugin is not a
+  // function" on a toolchain that was installed correctly, so peel until a
+  // function appears and stop on a bounded count.
+  const unwrapFactory = (mod) => {
+    let cur = mod
+    for (let depth = 0; depth < 5 && cur != null; depth += 1) {
+      if (typeof cur === 'function') return cur
+      if (typeof cur.createVuePlugin === 'function') return cur.createVuePlugin
+      if (typeof cur.default === 'undefined') break
+      cur = cur.default
+    }
+    return null
+  }
+
   let vue2plugin = null
   let pluginName = ''
+  const pluginShapes = []
   for (const name of ['vite-plugin-vue2', '@vitejs/plugin-vue2']) {
     try {
       const mod = await loadOwn(name)
-      vue2plugin = mod.default ?? mod
+      const factory = unwrapFactory(mod)
+      if (!factory) {
+        pluginShapes.push(`${name}: ${Object.keys(mod || {}).join(',') || typeof mod}`)
+        continue
+      }
+      vue2plugin = factory
       pluginName = name
       break
     } catch {
       // try the next plugin name
     }
   }
-  if (vue2plugin === null) throw new Error('no Vue 2 SFC plugin in the toolchain')
+  if (vue2plugin === null) {
+    throw new Error(
+      `no Vue 2 SFC plugin in the toolchain${pluginShapes.length ? ` (found ${pluginShapes.join('; ')})` : ''}`,
+    )
+  }
   result.components.push(`plugin:${pluginName}`)
 
   const vueServerMod = await loadOwn('vue-server-renderer')
@@ -303,8 +365,17 @@ async function main() {
     // The version pairing is not optional: the template compiler emits render
     // functions for its own Vue build, and a mismatch makes every component
     // render as an empty comment.
+    //
+    // `vue-template-compiler` and `element-ui` are both CommonJS, and Vite 2's
+    // dev SSR evaluates everything as ESM: loading them through
+    // `vite.ssrLoadModule` fails with `module is not defined`, which is not a
+    // configuration mistake — Vite 2 simply has no CJS interop on that path.
+    // `ssr.noExternal` does not change it (measured). So the CommonJS half is
+    // required natively against the *mirror*, while `vue` keeps coming through
+    // Vite; Element UI is then installed onto that Vue instance explicitly, so
+    // the two halves share one renderer.
     try {
-      const compiler = await vite.ssrLoadModule('vue-template-compiler')
+      const { mod: compiler } = await loadCommonJS(vite, 'vue-template-compiler')
       const version = (compiler.default ?? compiler).version
       if (version && version !== Vue.version) {
         result.errors.push(`vue-template-compiler ${version} != vue ${Vue.version}`)
@@ -315,9 +386,11 @@ async function main() {
 
     // --- Element UI, globally, exactly as main.js does ---------------------
     try {
-      const element = await vite.ssrLoadModule('element-ui')
-      Vue.use(element.default ?? element)
-      result.components.push('element-ui:global')
+      const { mod: element, via } = await loadCommonJS(vite, 'element-ui')
+      const ElementUI = element.default ?? element
+      if (typeof ElementUI.install === 'function') ElementUI.install(Vue)
+      else Vue.use(ElementUI)
+      result.components.push(`element-ui:${via}`)
     } catch (err) {
       result.errors.push(`element-ui: ${err.message}`)
     }

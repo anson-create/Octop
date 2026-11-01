@@ -101,6 +101,13 @@ _SSR_PLANS: dict[str, SsrPlan] = {
         # otherwise Vue refuses to render at all. The compiler is listed
         # explicitly because npm's automatic peer install would pick the latest
         # 2.x (2.7) and mismatch this app's 2.6.
+        #
+        # `vite-plugin-vue2@1.9` peers on ``vite@^2``, so the toolchain is
+        # ``vite@2.9.18`` — installing ``vite@^4`` fails dependency resolution
+        # outright (ERESOLVE), and ``@vitejs/plugin-vue2`` is not a substitute
+        # because it requires ``vue@^2.7``. Measured on the deployment host,
+        # 2026-11-01: vite 2.9.18 + plugin 1.9.3 + renderer/compiler 2.6.10
+        # renders a Vue 2.6 SFC on Node 24.
         toolchain="vue2",
         toolchain_requirements=(
             "vite",

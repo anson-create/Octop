@@ -130,5 +130,9 @@ graphify-out/
 
 # Scratch dirs/files left behind by the test runner when TMPDIR is unavailable.
 # The random 8-character names are tempfile probe files, not project data.
+# Anchored to the repository root on purpose: an unanchored 8-character pattern
+# also matches *directories* at any depth, and it silently swallowed
+# `cli/commands`, `security`, `settings`, `adapters`, `channels`, `handlers`
+# and `pomodoro` out of every wheel built from this tree — 64 modules.
 .ptb/
-[0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z]
+/[0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z][0-9a-z]
