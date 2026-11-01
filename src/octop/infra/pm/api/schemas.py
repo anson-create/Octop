@@ -60,6 +60,21 @@ class JiraConfig(BaseModel):
     verify_tls: bool = True
 
 
+class JiraConnectorBinding(BaseModel):
+    """Point this workspace's Jira at an MCP connector that already has it.
+
+    No credential here on purpose: the site URL and token stay inside the
+    connector, so this payload cannot leak them and the row it writes is safe
+    to dump.
+    """
+
+    connector_instance_id: str = Field(min_length=1, max_length=64)
+    # Which server inside a multi-server connector to use. Empty means "the one
+    # whose name mentions jira".
+    server_key: str = ""
+    jql: str | None = None
+
+
 class JiraProjectMapping(BaseModel):
     """Which source repositories a Jira project's requirements belong to.
 

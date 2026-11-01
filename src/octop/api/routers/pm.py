@@ -21,6 +21,7 @@ from octop.infra.pm.api.schemas import (
     ChangeCreate,
     IntegrationUpsert,
     JiraConfig,
+    JiraConnectorBinding,
     JiraProjectMapping,
     ReflowRequest,
     RejectRequest,
@@ -97,6 +98,44 @@ async def jira_probe(
     _: Any = Depends(require_permission("pm_decide")),
 ) -> dict[str, Any]:
     return pm.probe_jira(workspace_id)
+
+
+@router.get("/jira/connectors", summary="Connectors that already carry Jira")
+async def jira_connectors(
+    pm: PMService = Depends(get_pm),
+    _: Any = Depends(require_permission("pm")),
+) -> dict[str, Any]:
+    """What the binding picker may offer.
+
+    Only connectors with a Jira server inside them are listed; picking any other
+    one would fail on the first query with a message that points at the tool,
+    not at the choice.
+    """
+
+    items = pm.list_jira_connectors()
+    return {"items": items, "total": len(items)}
+
+
+@router.post("/jira/bind-connector", summary="Use an MCP connector as the Jira source")
+async def jira_bind_connector(
+    body: JiraConnectorBinding,
+    workspace_id: int,
+    pm: PMService = Depends(get_pm),
+    _: Any = Depends(require_permission("pm_decide")),
+) -> dict[str, Any]:
+    """Store *which* connector, never the credential.
+
+    The site URL and token stay in the connector's encrypted blob and are read
+    at call time. Rotating them there rotates them here, with no second edit and
+    nothing to leak from a database dump.
+    """
+
+    return pm.bind_jira_connector(
+        workspace_id,
+        connector_instance_id=body.connector_instance_id,
+        server_key=body.server_key,
+        jql=body.jql,
+    )
 
 
 @router.get("/jira/issues", summary="Candidates for intake")

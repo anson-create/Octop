@@ -764,13 +764,62 @@ class PMService:
             return {}
         return loads(item.mapping_json, {}) or {}
 
+    def _write_integration_mapping(self, workspace_id: int, mapping: dict[str, Any]) -> None:
+        """Persist the jira integration's mapping, leaving the other columns alone.
+
+        ``credential_ref`` and ``mode`` belong to the REST transport and are
+        carried over unchanged; a workspace bound to a connector simply has no
+        credential of its own.
+        """
+
+        item = self._repos.integrations.get_by_vendor(workspace_id, "jira")
+        self._repos.integrations.upsert(
+            workspace_id=workspace_id,
+            vendor="jira",
+            enabled=bool(item.enabled) if item is not None else True,
+            mode=str(getattr(item, "mode", "real") or "real") if item is not None else "real",
+            credential_ref=getattr(item, "credential_ref", None) if item is not None else None,
+            mapping=mapping,
+        )
+
     def jira_status(self, workspace_id: int) -> dict[str, Any]:
-        """What the picker needs to know before it tries to list anything."""
+        """What the picker needs to know before it tries to list anything.
+
+        ``configured`` means different things per transport, and conflating them
+        is how a workspace ends up showing a picker that cannot list anything:
+        REST needs a site URL plus token, MCP needs a live connector with a Jira
+        server in it. No credential is ever read for the MCP branch — only the
+        connector's identity is checked.
+        """
+
         mapping = self._jira_mapping(workspace_id)
         item = self._repos.integrations.get_by_vendor(workspace_id, "jira")
+        transport = str(mapping.get("transport") or "rest").strip().lower()
         username, token = self._jira_credential(workspace_id)
+
+        if transport == "mcp":
+            instance_id = str(mapping.get("connector_instance_id") or "")
+            server_key = str(mapping.get("connector_server") or "")
+            spec = self._mcp_server_spec(instance_id, server_key)
+            return {
+                "configured": spec is not None,
+                "transport": "mcp",
+                "base_url": str((spec or {}).get("base_url") or mapping.get("base_url") or ""),
+                "jql": str(mapping.get("jql") or ""),
+                "verify_tls": True,
+                "token_set": spec is not None,
+                "auth": "mcp",
+                "connector_instance_id": instance_id,
+                "connector_server": str((spec or {}).get("server_key") or server_key),
+                "connector_display": str((spec or {}).get("display_name") or ""),
+                "enabled": bool(item.enabled) if item is not None else False,
+                "last_probe_at": getattr(item, "last_probe_at", None) if item is not None else None,
+                "probe_status": getattr(item, "probe_status", None) if item is not None else None,
+            }
+
         return {
             "configured": bool(mapping.get("base_url") and token),
+            "transport": "rest",
             "base_url": str(mapping.get("base_url") or ""),
             "jql": str(mapping.get("jql") or ""),
             "verify_tls": bool(mapping.get("verify_tls", True)),
@@ -806,19 +855,32 @@ class PMService:
             "priority_hits": [],
             "ok": False,
             "error": "",
+            "note": "",
         }
         try:
             with self.jira_client(workspace_id) as client:
                 me = client.myself()
                 result["user"] = str(me.get("displayName") or me.get("name") or "")
-                result["statuses"] = client.statuses()
-                result["priorities"] = client.priorities()
+                # A client may return a tuple; the response schema is a list.
+                result["statuses"] = list(client.statuses())
+                result["priorities"] = list(client.priorities())
         except PortError as exc:
             result["error"] = str(exc)
             return result
 
         result["status_hits"] = _matching_defaults(INTAKE_STATUSES, result["statuses"])
         result["priority_hits"] = _matching_defaults(INTAKE_PRIORITIES, result["priorities"])
+        if not result["statuses"] and not result["priorities"]:
+            # The connector transport exposes no global status/priority catalogue.
+            # Reporting "ok: false" there would be a false alarm — it reads as
+            # "this site never heard of 待设计" and sends the operator to edit a
+            # JQL that was fine. An unmatched JQL simply returns no rows.
+            result["ok"] = True
+            result["note"] = (
+                "该工作区通过连接器（MCP）接入 Jira，服务端不提供全局状态/优先级清单；"
+                "默认队列直接按 JQL 查询，状态名对不上时返回空列表而不是报错。"
+            )
+            return result
         result["ok"] = bool(result["status_hits"]) and bool(result["priority_hits"])
         return result
 
@@ -1087,12 +1149,138 @@ class PMService:
         result["requirement_id"] = requirement_id
         return result
 
+    # --- jira transport: MCP connector vs stored REST credential ----------
+
+    def _mcp_server_spec(self, instance_id: str, server_key: str = "") -> dict[str, Any] | None:
+        """Read one connector's MCP server spec (command/args/env).
+
+        The credential stays where the operator put it — the connector's
+        encrypted blob — and is decrypted into memory only to be handed to the
+        child process. Nothing is copied into PM's own secret store, so rotating
+        it in the connector rotates it here too, with no second edit.
+
+        Returns ``None`` when the connector is gone, disabled, or has no Jira
+        server, so the caller can say which of those it was.
+        """
+
+        from octop.infra.connectors.crypto import decrypt_credentials  # noqa: PLC0415
+        from octop.infra.db.repos.connectors import ConnectorRepo  # noqa: PLC0415
+
+        if not instance_id:
+            return None
+        row = ConnectorRepo(self._db).get(instance_id)
+        if row is None or not row.credential_blob:
+            return None
+        if str(getattr(row, "status", "") or "") != "active":
+            return None
+
+        creds = decrypt_credentials(self._jira_secrets(), row.credential_blob)
+        servers = creds.get("servers") if isinstance(creds, dict) else None
+        if not isinstance(servers, dict) or not servers:
+            return None
+
+        chosen: tuple[str, dict[str, Any]] | None = None
+        if server_key and isinstance(servers.get(server_key), dict):
+            chosen = (server_key, servers[server_key])
+        else:
+            # No explicit choice: take the first server that calls itself Jira.
+            # Anything else (mail, other MCPs sharing the connector) has a
+            # different tool namespace and would answer "unknown tool".
+            for name, item in servers.items():
+                if not isinstance(item, dict):
+                    continue
+                hint = f"{name} {item.get('display_name') or ''}".lower()
+                if "jira" in hint:
+                    chosen = (name, item)
+                    break
+        if chosen is None:
+            return None
+
+        name, item = chosen
+        command = str(item.get("command") or "").strip()
+        if not command:
+            return None
+        env = item.get("env") if isinstance(item.get("env"), dict) else {}
+        args = item.get("args") if isinstance(item.get("args"), list) else []
+        return {
+            "connector_instance_id": instance_id,
+            "server_key": name,
+            "command": command,
+            "args": [str(a) for a in args],
+            "env": {str(k): str(v) for k, v in env.items()},
+            "display_name": str(item.get("display_name") or name),
+            "username": str(env.get("JIRA_USERNAME") or ""),
+            "base_url": str(env.get("JIRA_URL") or "").rstrip("/"),
+        }
+
+    def _mcp_jira_client(self, mapping: dict[str, Any]) -> Any:
+        from octop.infra.pm.ports.base import PortUnavailable  # noqa: PLC0415
+        from octop.infra.pm.ports.mcp_jira import McpJiraClient, session_for  # noqa: PLC0415
+
+        instance_id = str(mapping.get("connector_instance_id") or "")
+        server_key = str(mapping.get("connector_server") or "")
+        spec = self._mcp_server_spec(instance_id, server_key)
+        if spec is None:
+            raise PortUnavailable(
+                "Jira 走连接器接入，但找不到可用的连接器："
+                f"实例 {instance_id or '（未指定）'} 不存在、已停用，或其配置里没有 Jira 服务。"
+            )
+        session = session_for(
+            f"{instance_id}:{spec['server_key']}",
+            spec["command"],
+            spec["args"],
+            spec["env"],
+        )
+        return McpJiraClient(
+            session,
+            base_url=spec["base_url"],
+            username=spec["username"],
+        )
+
+    def list_jira_connectors(self) -> list[dict[str, Any]]:
+        """Connectors that actually carry a Jira server.
+
+        Only those are bindable. Offering every connector would let an operator
+        pick their mail connector and get "unknown tool" on the first query,
+        with nothing in the message pointing back at the choice.
+        """
+
+        from octop.infra.db.repos.connectors import ConnectorRepo  # noqa: PLC0415
+
+        out: list[dict[str, Any]] = []
+        for row in ConnectorRepo(self._db).list_by_kind("custom-mcp"):
+            spec = self._mcp_server_spec(row.instance_id)
+            if spec is None:
+                continue
+            out.append(
+                {
+                    "instance_id": row.instance_id,
+                    "display_name": str(row.display_name or ""),
+                    "status": str(getattr(row, "status", "") or ""),
+                    "server_key": spec["server_key"],
+                    "server_display": spec["display_name"],
+                    "base_url": spec["base_url"],
+                    "username": spec["username"],
+                }
+            )
+        return out
+
     def jira_client(self, workspace_id: int) -> Any:
-        """Build a client from stored config. Raises PortUnavailable when unset."""
+        """Build a client from stored config. Raises PortUnavailable when unset.
+
+        Two transports. ``transport=mcp`` drives the Jira server the operator
+        already configured as a connector, so the credential is entered once and
+        rotations propagate. An empty or ``rest`` transport keeps the old
+        site+token path untouched, so an existing install is unaffected.
+        """
+
         from octop.infra.pm.ports.base import PortUnavailable  # noqa: PLC0415
         from octop.infra.pm.ports.jira import JiraClient  # noqa: PLC0415
 
         mapping = self._jira_mapping(workspace_id)
+        if str(mapping.get("transport") or "").strip().lower() == "mcp":
+            return self._mcp_jira_client(mapping)
+
         base_url = str(mapping.get("base_url") or "")
         username, token = self._jira_credential(workspace_id)
         if not base_url:
@@ -1105,6 +1293,49 @@ class PMService:
             username=username,
             verify_tls=bool(mapping.get("verify_tls", True)),
         )
+
+    def bind_jira_connector(
+        self,
+        workspace_id: int,
+        *,
+        connector_instance_id: str,
+        server_key: str = "",
+        jql: str | None = None,
+    ) -> dict[str, Any]:
+        """Point this workspace's Jira at an existing MCP connector.
+
+        Stores only *which* connector and *which* server inside it. The site URL
+        and token keep living in the connector, so this row is not a credential
+        and a database dump stays harmless.
+        """
+
+        if self._repos.workspaces.get(workspace_id) is None:
+            raise errors.not_found("workspace", workspace_id)
+        spec = self._mcp_server_spec(connector_instance_id, server_key)
+        if spec is None:
+            # PortUnavailable is a RuntimeError, not an OctopError, so raising it
+            # from a route would surface as a 500 with no explanation. This is a
+            # rejected precondition, which is a 400 with a message.
+            raise errors.invalid(
+                f"连接器 {connector_instance_id} 不可用：不存在、已停用，或其配置里没有 Jira 服务"
+            )
+
+        mapping = dict(self._jira_mapping(workspace_id))
+        # A stored rest credential would shadow the connector if the transport
+        # flag were ever lost, so the site URL is kept in step with the
+        # connector rather than left stale.
+        mapping.update(
+            {
+                "transport": "mcp",
+                "connector_instance_id": connector_instance_id,
+                "connector_server": spec["server_key"],
+                "base_url": spec["base_url"],
+            }
+        )
+        if jql is not None:
+            mapping["jql"] = jql
+        self._write_integration_mapping(workspace_id, mapping)
+        return self.jira_status(workspace_id)
 
     def probe_jira(self, workspace_id: int) -> dict[str, Any]:
         from octop.infra.pm.ports.base import PortError  # noqa: PLC0415
