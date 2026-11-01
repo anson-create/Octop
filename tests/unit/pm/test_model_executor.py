@@ -195,6 +195,90 @@ def test_prototype_passes_shape_gates() -> None:
     assert out.artifact["fidelity_note"]
 
 
+# A page as the deriver would hand it back: real SFC template, real class names.
+BASELINE_TEMPLATE = (
+    '<div class="vendor-list">'
+    '<form class="filter-bar"><input class="kw" /></form>'
+    '<table class="grid"><tr><td /></tr></table>'
+    '<button class="go">筛选</button></div>'
+)
+
+
+def _baseline() -> Any:
+    from octop.infra.pm.runtime.prototype_source import SourceBaseline
+
+    return SourceBaseline(
+        page="control-tower/src/views/vendor/index.vue",
+        repo_key="cwx-web",
+        template=BASELINE_TEMPLATE,
+        script="data() { return { keyword: '' } }",
+        style=".vendor-list{padding:12px}",
+        size=900,
+        lines=42,
+        classes=("filter-bar", "go", "grid", "kw", "vendor-list"),
+        components=(),
+    )
+
+
+def _outcome_with_baseline() -> Any:
+    from octop.infra.pm.runtime.prototype_derive import DerivationOutcome
+
+    return DerivationOutcome(ok=True, baseline=_baseline())
+
+
+def _transcribing_executor(html: str) -> ModelStepExecutor:
+    """An executor whose model answers the transcribe prompt with ``html``."""
+
+    return ModelStepExecutor(
+        models_provider=lambda: FakeFactory(SCRIPT + (("1:1 转写", html),)),
+        prototype_source=lambda source, query, evidence=None: _outcome_with_baseline(),
+    )
+
+
+def test_prototype_is_transcribed_from_the_page_source() -> None:
+    """With a baseline, the model gets the SFC and keeps its class names.
+
+    This is the path that replaces "render the component": the fidelity number is
+    the share of the page's own classes that survived into the transcription,
+    computed locally without node or a single installed dependency.
+    """
+
+    html = (
+        "<style>.vendor-list{padding:12px}</style>"
+        '<div class="vendor-list"><form class="filter-bar"><input class="kw" />'
+        '</form><table class="grid"><tr><td>供应商 A</td></tr></table>'
+        '<button class="go">筛选</button><!-- [新增点] 就绪筛选 --></div>'
+    )
+    out = _transcribing_executor(html).run(_ctx("prototype"))
+
+    assert out.artifact["origin"] == "source"
+    assert out.artifact["fidelity"] == "exact"
+    assert out.artifact["source_repo"]["page"].endswith("vendor/index.vue")
+    # Every source class survived, so the overlap is 1.0 — not a guess.
+    assert out.artifact["source_repo"]["class_overlap"] == 1.0
+    assert "留存 100%" in str(out.artifact["fidelity_note"])
+
+
+def test_a_transcription_that_drops_the_structure_is_flagged_not_passed_off() -> None:
+    """A rewrite that keeps nothing of the page must not be called 1:1.
+
+    Without this check the step is back to "the model drew something that looks
+    like an admin page", which is the exact failure the derivation exists to
+    prevent — so the overlap is reported and a gap is raised.
+    """
+
+    html = (
+        "<style>.mine{display:block}</style>"
+        '<div class="mine"><input placeholder="搜索" /><button>查询</button></div>'
+    )
+    out = _transcribing_executor(html).run(_ctx("prototype"))
+
+    assert out.artifact["origin"] == "source"
+    assert out.artifact["fidelity"] == "partial"
+    assert out.artifact["source_repo"]["class_overlap"] == 0.0
+    assert any("class 留存率" in gap for gap in out.gaps)
+
+
 def test_decision_returns_a_card_not_an_artifact() -> None:
     out = _executor().run(_ctx("decision"))
     assert out.status == "needs_decision"

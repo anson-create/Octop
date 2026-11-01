@@ -33,6 +33,7 @@ from octop.infra.pm.runtime.executor import (
     StepOutput,
 )
 from octop.infra.pm.runtime.prototype_derive import DerivationOutcome, derive_from_source
+from octop.infra.pm.runtime.prototype_source import extract_classes
 
 MODEL_STEPS: tuple[str, ...] = (
     "link_expand",
@@ -776,7 +777,11 @@ class ModelStepExecutor:
         query = f"{ctx.requirement_title}\n{ctx.requirement_text}"
         outcome = self._derive_prototype(source, query, locate)
         if outcome is not None and outcome.ok and outcome.prototype is not None:
+            # Only reachable when the deriver was asked to render as well. The
+            # render *is* the artifact in that case, so it is preferred.
             return self._derived_prototype(ctx, outcome)
+        if outcome is not None and outcome.ok and outcome.baseline is not None:
+            return self._baseline_prototype(ctx, outcome, analysis)
         return self._invented_prototype(ctx, analysis, source, outcome)
 
     def _derive_prototype(
@@ -917,6 +922,191 @@ class ModelStepExecutor:
                 "tool_calls": ["graph.locate", "vue.ssr"],
                 "kinds": [tag for tag in _ELEMENT_TAGS if tag in prototype.html.lower()],
                 "html_len": len(prototype.html),
+                "source_repo": dict(ctx.source_repo or {}),
+                "derivation": outcome.as_dict(),
+            },
+        )
+
+    def _baseline_prototype(
+        self, ctx: StepContext, outcome: DerivationOutcome, analysis: str
+    ) -> StepOutput:
+        """Transcribe the page from its own source — the main path.
+
+        The model is given the SFC itself, not a description of the screen. That
+        is the whole difference: with the source in hand, "kept the block order"
+        and "invented a plausible dashboard" are distinguishable by looking at
+        the output, and the class names are the source's own rather than the
+        model's guesses.
+
+        Fidelity is measured locally against the source template. Rendering the
+        component would give a second, independent number, but it needs a full
+        Node toolchain; the transcription overlap needs nothing beyond the file
+        that was just read, so the step stays useful on any mirror.
+        """
+
+        baseline = outcome.baseline
+        if baseline is None:  # pragma: no cover - the caller checks this first
+            raise ExecutorUnavailable("baseline path entered without a baseline")
+
+        blocks = [
+            f"页面文件：{baseline.repo_key}/{baseline.page}"
+            f"（{baseline.lines} 行，{baseline.size} 字节）",
+            "【template 原文 —— 这是结构唯一依据】",
+            baseline.template,
+        ]
+        if baseline.script:
+            blocks += ["【script 原文 —— 只看它绑了哪些字段与状态，不要照抄逻辑】", baseline.script]
+        if baseline.style:
+            blocks += ["【style 原文 —— 只看间距、字号与颜色】", baseline.style]
+        source_block = "\n".join(blocks)
+
+        raw = self._ask(
+            system=(
+                _BASE_SYSTEM
+                + " 这次例外：你要输出一段可直接渲染的 HTML 片段，不要包 markdown 代码块，"
+                "不要输出 <html>/<head>/<body> 标签，只输出一个 <div> 起的片段加 <style>。"
+            ),
+            user=(
+                "任务：把下面这个真实页面的模板，1:1 转写成可独立打开的 HTML 片段。\n"
+                f"需求标题：{ctx.requirement_title}\n"
+                f"需求要改的地方：{ctx.requirement_text}\n\n"
+                f"{source_block}\n\n"
+                "硬性要求（逐条照做，这是评审会核对的）：\n"
+                "1. **结构照抄 template**：区块顺序、嵌套层级、字段排列、按钮位置一律与原文一致，"
+                "不得增删区块，不得自行调整布局\n"
+                "2. **class 名照抄**：原文出现的 class 必须原样保留（el-table、el-form、a-card 等），"
+                "不要替换成自己起的名字，不要改写成 Tailwind\n"
+                "3. **只换两样东西**：业务文案换成本需求的措辞，数据换成贴合场景的假数据\n"
+                "4. 原文里用 `v-if`/`v-for`/`:class` 表达的部分，按最贴近需求的那种状态展开成静态结构\n"
+                "5. 用 <style> 补齐组件库样式缺失的部分（间距、边框、字号），不要用外部图片或 CDN\n"
+                "6. 需求要新增/修改的位置，用注释 `<!-- [新增点] 说明 -->` 标出来\n"
+            ),
+        )
+        html = _clean_html(raw)
+        kinds = [tag for tag in _ELEMENT_TAGS if tag in html.lower()]
+        if len(kinds) < 2:
+            raise ExecutorUnavailable(
+                f"prototype has fewer than two element kinds after cleanup: {kinds}"
+            )
+
+        # Local, dependency-free fidelity measurement: how much of the page's own
+        # class vocabulary survived into the transcription.
+        written = extract_classes(html)
+        source_classes = set(baseline.classes)
+        overlap = (
+            len(written & source_classes) / len(source_classes) if source_classes else 0.0
+        )
+        missing = sorted(source_classes - written)[:8]
+        anchor = f"{baseline.repo_key}/{baseline.page}"
+
+        if overlap >= 0.7:
+            fidelity = "exact"
+            verdict = f"按 {baseline.page} 的模板转写，class 留存 {overlap:.0%}"
+        elif overlap >= 0.4:
+            fidelity = "partial"
+            verdict = f"按 {baseline.page} 的模板转写，但只留存 {overlap:.0%} 的 class，部分结构被改写"
+        else:
+            fidelity = "partial"
+            verdict = (
+                f"虽以 {baseline.page} 为基线，但 class 只留存 {overlap:.0%}，"
+                "很可能没按原文结构复刻，需人工核对"
+            )
+
+        notes = [verdict]
+        if baseline.note:
+            notes.append(baseline.note)
+        if outcome.reason:
+            notes.append(outcome.reason)
+        if missing:
+            notes.append(f"丢失的 class 例如：{'、'.join(missing)}")
+        note = "；".join(notes) + "。静态假数据，未接真实接口，未经设计评审。"
+
+        evidence = [
+            _envelope(
+                source_type="human",
+                locator=_pm_record("requirement", ctx.task_public_id),
+                excerpt=_clip(f"原型依据需求 {ctx.task_public_id}：{ctx.requirement_text}"),
+                confidence=0.6,
+            ),
+            _envelope(
+                source_type="code",
+                locator={
+                    "kind": "code_span",
+                    "repo": baseline.repo_key,
+                    "path": baseline.page,
+                    "lines": f"1-{baseline.lines}",
+                },
+                excerpt=(
+                    f"{anchor} 共 {baseline.lines} 行，模板含 {len(baseline.classes)} 个 class、"
+                    f"{len(baseline.components)} 类组件；转写后 class 留存 {overlap:.0%}"
+                ),
+                confidence=0.9 if overlap >= 0.7 else 0.65,
+            ),
+        ]
+
+        gaps: list[str] = []
+        if overlap < 0.7:
+            gaps.append(
+                f"class 留存率 {overlap:.0%}，低于 1:1 阈值 70%；"
+                f"请对照 {anchor} 逐块核对"
+            )
+        if outcome.location.ambiguous:
+            shortlist = "、".join(item.source_file for item in outcome.location.candidates[:3])
+            gaps.append(f"页面定位不唯一，当前取 {baseline.page}；其他候选：{shortlist}")
+        gaps.append("转写稿未经浏览器实跑，组件库样式按 class 近似还原")
+
+        return StepOutput(
+            status="passed",
+            artifact={
+                "kind": "prototype_html",
+                "title": "交互原型",
+                "audience": "internal",
+                "fidelity": fidelity,
+                "fidelity_note": note,
+                "origin": "source",
+                "body": html,
+                "source_repo": {
+                    "project": str(dict(ctx.source_repo or {}).get("project") or ""),
+                    "mapped": True,
+                    "web_repo": baseline.repo_key,
+                    "system": str(dict(ctx.source_repo or {}).get("system") or ""),
+                    "derived": True,
+                    "page": baseline.page,
+                    "class_overlap": round(overlap, 3),
+                    "classes_source": len(source_classes),
+                    "page_ambiguous": outcome.location.ambiguous,
+                },
+            },
+            conclusions=[
+                {
+                    "text": (
+                        f"原型按 {anchor} 的 template 转写，class 留存 {overlap:.0%}"
+                        f"（源 {len(source_classes)} 个）。"
+                    ),
+                    "status": "evidenced",
+                    "evidence_indexes": [1],
+                },
+                {
+                    "text": (
+                        f"页面定位方式：{outcome.location.method}，检索词 "
+                        f"{'、'.join(outcome.location.terms[:5]) or '(无)'}。"
+                    ),
+                    "status": "evidenced",
+                    "evidence_indexes": [1],
+                },
+                {
+                    "text": "业务文案与假数据为模型填充，结构与 class 来自源码。",
+                    "status": "undetermined",
+                },
+            ],
+            evidence=evidence,
+            gaps=gaps,
+            trace={
+                "sources": ["requirement", "pm_analysis", "code"],
+                "tool_calls": ["graph.locate", "sfc.read", "model.transcribe"],
+                "kinds": kinds,
+                "html_len": len(html),
+                "class_overlap": round(overlap, 3),
                 "source_repo": dict(ctx.source_repo or {}),
                 "derivation": outcome.as_dict(),
             },

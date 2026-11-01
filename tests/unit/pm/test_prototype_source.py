@@ -16,10 +16,12 @@ from octop.infra.pm.domain.repos import REPOS
 from octop.infra.pm.runtime import prototype_source
 from octop.infra.pm.runtime.prototype_source import (
     PrototypeDeriver,
+    SourceBaseline,
     SsrRenderer,
     _collect_css,
     extract_classes,
     extract_tokens,
+    read_baseline,
 )
 
 PAGE = "/src/views/customer/company-management/index.vue"
@@ -305,3 +307,88 @@ def test_derivation_failure_never_claims_exact_fidelity(tmp_path: Path) -> None:
     assert derived.fidelity == "partial"
     assert derived.html == ""
     assert "未能从源码派生" in derived.fidelity_note
+
+
+# --- reading the source a prototype is transcribed from -----------------------
+
+SFC = """<template>
+  <div class="vendor-list">
+    <el-form class="filter-bar"><el-input v-model="kw" /></el-form>
+    <el-table class="grid" :data="rows" />
+  </div>
+</template>
+
+<script>
+export default {
+  data() {
+    return { kw: '', rows: [] }
+  },
+}
+</script>
+
+<style lang="scss" scoped>
+.vendor-list { padding: 12px; }
+</style>
+"""
+
+
+def test_a_page_is_read_as_three_separate_blocks(tmp_path: Path) -> None:
+    """Template, script and style answer different questions and stay apart.
+
+    The template is what gets transcribed, the script says which state it binds
+    to, the style decides spacing. Flattening them into one blob makes the model
+    treat CSS declarations as structure.
+    """
+
+    (tmp_path / "views").mkdir()
+    (tmp_path / "views" / "vendor.vue").write_text(SFC, encoding="utf-8")
+
+    baseline = read_baseline(tmp_path, "views/vendor.vue", "cwx-web")
+
+    assert baseline.usable is True
+    assert "vendor-list" in baseline.template
+    assert "kw: ''" in baseline.script
+    assert "padding: 12px" in baseline.style
+    # Scoped and lang attributes must not hide the blocks.
+    assert baseline.style
+    assert baseline.classes == ("filter-bar", "grid", "vendor-list")
+    assert baseline.components == ("el-form", "el-input", "el-table")
+    assert baseline.note == ""
+
+
+def test_a_page_without_a_template_falls_back_to_the_whole_file(tmp_path: Path) -> None:
+    """A .tsx page has no SFC blocks; its JSX *is* the template."""
+
+    (tmp_path / "page.tsx").write_text(
+        'export default () => <div className="grid"><table /></div>', encoding="utf-8"
+    )
+
+    baseline = read_baseline(tmp_path, "page.tsx", "cwx-web")
+
+    assert baseline.usable is True
+    assert "className" in baseline.template
+    assert "没有 <template> 块" in baseline.note
+
+
+def test_a_huge_template_is_truncated_and_says_so(tmp_path: Path) -> None:
+    """A silently cut template yields a prototype missing its lower half.
+
+    Worse than a short one, because nothing on the artifact hints that the source
+    was clipped — so the cut is recorded in the note.
+    """
+
+    body = '<div class="a">' + ("<p>x</p>" * 2000) + "</div>"
+    (tmp_path / "big.vue").write_text(f"<template>{body}</template>", encoding="utf-8")
+
+    baseline = read_baseline(tmp_path, "big.vue", "cwx-web", max_chars=500)
+
+    assert len(baseline.template) == 500
+    assert "截到 500 字" in baseline.note
+
+
+def test_an_unreadable_page_is_not_a_baseline(tmp_path: Path) -> None:
+    baseline = read_baseline(tmp_path, "nope.vue", "cwx-web")
+
+    assert isinstance(baseline, SourceBaseline)
+    assert baseline.usable is False
+    assert "读取失败" in baseline.note

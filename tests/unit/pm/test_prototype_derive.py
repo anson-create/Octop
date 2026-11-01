@@ -336,39 +336,65 @@ def _installed(base: Path, packages: tuple[str, ...]) -> None:
         (base / "node_modules" / name).mkdir(parents=True, exist_ok=True)
 
 
-def test_a_mirror_without_dependencies_is_refused_before_node_runs(tmp_path: Path) -> None:
-    """A freshly cloned mirror has no node_modules — say that, not "no json"."""
+def test_a_mirror_without_dependencies_still_yields_a_baseline(tmp_path: Path) -> None:
+    """A freshly cloned mirror has no node_modules — that must not stop the step.
 
-    root = tmp_path / "mirror"
-    root.mkdir()
+    It used to be a hard refusal, which was the wrong trade: the source needed
+    to write the prototype is in the checkout whether or not anyone ran `npm
+    install`, and dependencies are only needed to *render* the result for a
+    fidelity measurement. Refusing told the operator to install 81 packages to
+    do work that needs none of them.
+    """
+
+    root = _routed_repo(tmp_path)
+    evidence = LocateEvidence(
+        sources=(EvidenceSource("component", "Jira 组件", "供应商管理", WEIGHT_COMPONENT),)
+    )
     spec = _spec("cw-web", root)
     try:
-        outcome = derive_from_source(spec, "海运订舱列表加筛选", timeout_s=1)
+        outcome = derive_from_source(spec, "", evidence=evidence, timeout_s=1)
     finally:
         object.__setattr__(spec, "mirror", "/opt/pm-mirror/cw-web")
 
-    assert outcome.ok is False
-    assert "没有安装依赖" in outcome.reason
-    assert "vue" in outcome.reason
+    assert outcome.ok is True
+    assert outcome.baseline is not None
+    assert outcome.baseline.usable
+    assert outcome.baseline.page.endswith("vendor/index.vue")
+    assert outcome.baseline.classes == ("page",)
+    # No render happened, so there is nothing to measure — and the outcome says
+    # so rather than reporting a fabricated zero.
     assert outcome.prototype is None
+    assert outcome.verified is False
 
 
-def test_a_missing_vue2_toolchain_is_named_rather_than_blamed_on_the_page(
+def test_a_missing_vue2_toolchain_is_named_when_verification_is_asked_for(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
-    root = tmp_path / "mirror"
-    root.mkdir()
+    """Asking for a render without the toolchain costs the measurement only.
+
+    The reason must name the missing packages: "I could not verify" and "the
+    page is broken" send an operator to different fixes.
+    """
+
+    root = _routed_repo(tmp_path)
     _installed(root, VUE2_PACKAGES)
     monkeypatch.setenv("OCTOP_PM_SSR_TOOLCHAIN", str(tmp_path / "tool"))
+    evidence = LocateEvidence(
+        sources=(EvidenceSource("component", "Jira 组件", "供应商管理", WEIGHT_COMPONENT),)
+    )
 
     spec = _spec("cw-web", root)
     try:
-        outcome = derive_from_source(spec, "海运订舱列表加筛选", timeout_s=1)
+        outcome = derive_from_source(
+            spec, "", evidence=evidence, timeout_s=1, verify=True
+        )
     finally:
         object.__setattr__(spec, "mirror", "/opt/pm-mirror/cw-web")
 
-    assert outcome.ok is False
-    assert "工具链未安装" in outcome.reason
+    assert outcome.ok is True
+    assert outcome.baseline is not None
+    assert outcome.prototype is None
+    assert "未做渲染校验" in outcome.reason
     assert "vite" in outcome.reason
 
 

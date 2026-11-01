@@ -114,6 +114,116 @@ class DerivedPrototype:
         return self.class_overlap >= 0.9 and self.classes_rendered > 0
 
 
+# The SFC's three blocks. `<template #foo>` and `<script setup lang="ts">` both
+# carry attributes, so the opening tag is matched loosely rather than as the
+# bare word — otherwise a scoped or ts block reads as "no script" and the
+# baseline silently loses the data the template binds to.
+_SFC_SCRIPT_RE = re.compile(r"<script([^>]*)>(.*?)</script>", re.DOTALL)
+
+# Namespaced component tags: `el-table`, `a-form-item`, `van-cell`. Native tags
+# have no dash and are not interesting here — they carry no library semantics.
+_COMPONENT_TAG_RE = re.compile(r"<([a-z][a-z0-9]*(?:-[a-z0-9]+)+)[\s/>]")
+
+
+@dataclass
+class SourceBaseline:
+    """The real page source a prototype has to be transcribed from.
+
+    This is what the product's own prototyping rules ask for: read the existing
+    page, keep its block order, spacing, button groups and dialog skeleton, then
+    write the logic HTML out of that. Rendering the component reaches the same
+    goal by a much heavier route — a working Node toolchain and every runtime
+    dependency installed — so it is kept as an optional fidelity *check* rather
+    than the way the prototype is produced.
+
+    The three blocks are kept separate rather than as one blob: the template is
+    what gets transcribed, the script explains which state the template binds
+    to, and the style decides spacing. A caller that only has room for one of
+    them should take the template.
+    """
+
+    page: str
+    repo_key: str
+    template: str = ""
+    script: str = ""
+    style: str = ""
+    size: int = 0
+    lines: int = 0
+    classes: tuple[str, ...] = ()
+    components: tuple[str, ...] = ()
+    note: str = ""
+
+    @property
+    def usable(self) -> bool:
+        """A baseline with no template cannot be transcribed from."""
+
+        return bool(self.template.strip())
+
+
+def read_baseline(
+    repo_root: Path,
+    page_rel: str,
+    repo_key: str,
+    *,
+    max_chars: int = 24000,
+) -> SourceBaseline:
+    """Read one page's SFC blocks, bounded so a huge page cannot flood a prompt.
+
+    ``max_chars`` applies to the template, which is the block that gets
+    transcribed. The script and style are capped lower and truncation is always
+    stated in ``note`` — a silently cut template produces a prototype that is
+    confidently missing its lower half, which is worse than a short one that
+    says it was short.
+    """
+
+    rel = (page_rel or "").lstrip("/")
+    path = Path(repo_root) / rel
+    if not rel:
+        return SourceBaseline(page="", repo_key=repo_key, note="没有页面路径")
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return SourceBaseline(page=rel, repo_key=repo_key, note=f"读取失败：{exc}")
+
+    notes: list[str] = []
+    template_match = _SFC_TEMPLATE_RE.search(text)
+    if template_match is None:
+        # A .tsx/.jsx page has no SFC blocks. Handing back the raw file is still
+        # better than an empty baseline: the JSX *is* the template there.
+        notes.append("没有 <template> 块，按整文件作为基线（可能是 .tsx/.jsx）")
+        template = text
+    else:
+        template = template_match.group(1)
+
+    script_match = _SFC_SCRIPT_RE.search(text)
+    style_match = _SFC_STYLE_RE.search(text)
+
+    if len(template) > max_chars:
+        notes.append(f"template 从 {len(template)} 字截到 {max_chars} 字")
+        template = template[:max_chars]
+    script = script_match.group(2).strip() if script_match else ""
+    if len(script) > 8000:
+        notes.append(f"script 从 {len(script)} 字截到 8000 字")
+        script = script[:8000]
+    style = style_match.group(2).strip() if style_match else ""
+    if len(style) > 8000:
+        notes.append(f"style 从 {len(style)} 字截到 8000 字")
+        style = style[:8000]
+
+    return SourceBaseline(
+        page=rel,
+        repo_key=repo_key,
+        template=template,
+        script=script,
+        style=style,
+        size=len(text.encode("utf-8", errors="replace")),
+        lines=text.count("\n") + 1,
+        classes=tuple(sorted(extract_classes(template))),
+        components=tuple(sorted(set(_COMPONENT_TAG_RE.findall(template)))),
+        note="；".join(notes),
+    )
+
+
 class SsrRenderer:
     """Runs ``render.mjs`` in a subprocess and parses its JSON reply."""
 

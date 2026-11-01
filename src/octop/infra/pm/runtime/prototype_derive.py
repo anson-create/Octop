@@ -8,17 +8,17 @@ Three questions have to be answered in order, and each one can fail honestly:
 2. **Which page in it?** ``locate_page`` — Chinese requirement text reaches the
    code's identifiers through the product's own i18n catalogue, then the
    tree-sitter graph maps identifiers to files.
-3. **Can it be rendered?** ``derive_from_source`` — the repo's own Vite config
-   plus Vue SSR, via the renderer its framework names (``assets/render.mjs`` for
-   Vue 3, ``assets/render.vue2.mjs`` for Vue 2). The two are not
-   interchangeable, and the prerequisites are checked before node is spawned so
-   that "the mirror has never been installed" is said out loud instead of
-   surfacing as a 240-second timeout.
+3. **What is on it?** ``derive_from_source`` — reads the page's own SFC (template,
+   script, style) so the prototype can be transcribed from it. Rendering the
+   component is a separate, optional step (``verify=True``) that measures the
+   result; the two differ in cost by an order of magnitude, and requiring the
+   measurement meant a mirror without `node_modules` produced nothing at all.
 
 Every failure returns a reason a human can act on ("mirror not synced", "no code
-graph", "no i18n match", "SSR crashed") instead of an empty string, because the
-prototype step prints that reason into the artifact's fidelity note. A prototype
-that could not be derived must say so; that is the whole point of the step.
+graph", "no i18n match", "the page has no template") instead of an empty string,
+because the prototype step prints that reason into the artifact's fidelity note.
+A prototype that could not be derived must say so; that is the whole point of the
+step.
 
 Indexes are cached per repository and invalidated by the index file's
 mtime+size, so a requirement costs one graph scan rather than one per step, and
@@ -42,7 +42,9 @@ from octop.infra.pm.ports.routes import RouteIndex
 from octop.infra.pm.runtime.prototype_source import (
     DerivedPrototype,
     PrototypeDeriver,
+    SourceBaseline,
     SsrRenderer,
+    read_baseline,
 )
 
 # The renderer ships inside the wheel so `pip install` alone enables derivation.
@@ -140,22 +142,39 @@ class PageLocation:
 
 @dataclass
 class DerivationOutcome:
-    """What the prototype step gets back: a page, or a reason there is none."""
+    """What the prototype step gets back: a page and its source, or a reason.
+
+    ``ok`` now means "the page was found and its source was read". It does not
+    mean the page was rendered: rendering is an optional fidelity check
+    (``verify=True``) that needs a full Node toolchain in the mirror, and making
+    the step depend on it meant a mirror without `node_modules` produced no
+    prototype at all — even though the source needed to write one was sitting
+    right there.
+    """
 
     ok: bool
     prototype: DerivedPrototype | None = None
+    baseline: SourceBaseline | None = None
     location: PageLocation = field(default_factory=PageLocation)
     reason: str = ""
 
     @property
     def page(self) -> str:
+        if self.baseline is not None:
+            return self.baseline.page
         if self.prototype is not None:
-            return self.prototype.source_page
+            return self.prototype.source_page.lstrip("/")
         return self.location.page
 
     @property
     def class_overlap(self) -> float:
         return self.prototype.class_overlap if self.prototype is not None else 0.0
+
+    @property
+    def verified(self) -> bool:
+        """Whether a render actually happened and produced a measurable overlap."""
+
+        return self.prototype is not None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -163,8 +182,20 @@ class DerivationOutcome:
             "reason": self.reason,
             "page": self.page,
             "location": self.location.as_dict(),
+            "verified": self.verified,
             "class_overlap": round(self.class_overlap, 3),
             "derived": bool(self.prototype is not None and self.prototype.derived),
+            "baseline": (
+                {
+                    "page": self.baseline.page,
+                    "lines": self.baseline.lines,
+                    "classes": len(self.baseline.classes),
+                    "components": list(self.baseline.components[:10]),
+                    "note": self.baseline.note,
+                }
+                if self.baseline is not None
+                else None
+            ),
         }
 
 
@@ -741,57 +772,28 @@ def derive_from_source(
     evidence: LocateEvidence | None = None,
     timeout_s: int = 240,
     renderer: SsrRenderer | None = None,
+    verify: bool = False,
 ) -> DerivationOutcome:
-    """Locate this requirement's page and render it. Never invents a page."""
+    """Locate this requirement's page and read its source. Never invents a page.
+
+    Rendering is off by default. The prototype is transcribed from the page's
+    own SFC — block order, spacing, button groups, dialog skeleton — which is
+    what the product's prototyping rules ask for and what a reviewer can check
+    against the file. A render only adds a *measurement* (``class_overlap``) on
+    top of that, so it runs only when ``verify`` is set, and its absence is not
+    a failure: a mirror without `node_modules` still yields a usable baseline,
+    it just cannot back the fidelity claim with a number.
+    """
 
     if not spec.renderable:
         return DerivationOutcome(
             ok=False,
-            reason=f"{spec.key} 不是前端仓库（{spec.framework}），无法渲染成原型",
-        )
-    plan = spec.ssr
-    if not plan.script:
-        return DerivationOutcome(
-            ok=False,
-            reason=f"{spec.key} 的框架 {spec.framework} 没有配套的 SSR 渲染器",
+            reason=f"{spec.key} 不是前端仓库（{spec.framework}），没有可复刻的页面源码",
         )
     root = spec.root()
     if not root.is_dir():
         return DerivationOutcome(
             ok=False, reason=f"源码镜像未同步：{root} 不存在，先跑同步脚本"
-        )
-
-    # Dependency checks run *before* locating, because they are cheap and they
-    # name a cause the operator can act on. Without it the run spends its time
-    # scanning the graph and then reports "ssr produced no json", which is the
-    # truth but not the reason.
-    absent = missing_packages(root, plan.mirror_requirements)
-    if absent:
-        return DerivationOutcome(
-            ok=False,
-            reason=(
-                f"源码镜像没有安装依赖（缺 {'、'.join(absent)}），node 起不来："
-                f"先在 {root} 里装一次依赖"
-            ),
-        )
-
-    base = root
-    if plan.toolchain:
-        base = toolchain_dir(plan.toolchain)
-        absent = missing_packages(base, plan.toolchain_requirements)
-        if absent:
-            return DerivationOutcome(
-                ok=False,
-                reason=(
-                    f"Vue 2 渲染工具链未安装：{base} 缺 {'、'.join(absent)}。"
-                    "该工具链不在产品仓库里，需在服务器上按 docs/deploy 的说明装一次"
-                ),
-            )
-
-    script = ensure_render_script(base, plan.script)
-    if script is None:
-        return DerivationOutcome(
-            ok=False, reason=f"包内缺少 {plan.script}，无法执行 SSR 渲染"
         )
 
     prefer = (spec.preferred_app,) if spec.preferred_app else ()
@@ -803,12 +805,60 @@ def derive_from_source(
             reason=location.notes[0] if location.notes else "未能在源码仓库中定位到对应页面",
         )
 
+    baseline = read_baseline(root, location.page, spec.key)
+    if not baseline.usable:
+        return DerivationOutcome(
+            ok=False,
+            location=location,
+            reason=f"页面 {location.page} 没有可复刻的内容：{baseline.note or '模板为空'}",
+        )
+
+    if not verify:
+        return DerivationOutcome(ok=True, baseline=baseline, location=location)
+
+    # From here on everything is optional measurement. A missing toolchain, a
+    # missing dependency or a crashed render downgrades the evidence, it does
+    # not throw away the baseline that was already read.
+    plan = spec.ssr
+    if not plan.script:
+        return DerivationOutcome(
+            ok=True,
+            baseline=baseline,
+            location=location,
+            reason=f"{spec.key} 的框架 {spec.framework} 没有配套的 SSR 校验器，已跳过校验",
+        )
+
+    absent = missing_packages(root, plan.mirror_requirements)
+    base = root
+    if plan.toolchain:
+        base = toolchain_dir(plan.toolchain)
+        absent = absent or missing_packages(base, plan.toolchain_requirements)
+    if absent:
+        return DerivationOutcome(
+            ok=True,
+            baseline=baseline,
+            location=location,
+            reason=f"未做渲染校验（缺 {'、'.join(absent)}），保真度未经机器测量",
+        )
+
+    script = ensure_render_script(base, plan.script)
+    if script is None:
+        return DerivationOutcome(
+            ok=True,
+            baseline=baseline,
+            location=location,
+            reason=f"未做渲染校验（包内缺少 {plan.script}）",
+        )
+
     renderer = renderer or SsrRenderer(script, timeout_s=timeout_s)
     prototype = PrototypeDeriver(renderer).derive(spec, f"/{location.page}")
     if not prototype.html:
         return DerivationOutcome(
-            ok=False,
+            ok=True,
+            baseline=baseline,
             location=location,
-            reason=f"页面 {location.page} 渲染失败：{prototype.fidelity_note}",
+            reason=f"未做渲染校验（{location.page} 渲染失败：{prototype.fidelity_note}）",
         )
-    return DerivationOutcome(ok=True, prototype=prototype, location=location)
+    return DerivationOutcome(
+        ok=True, prototype=prototype, baseline=baseline, location=location
+    )
