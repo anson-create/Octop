@@ -356,9 +356,10 @@ class ModelStepExecutor:
         a digest carrying the reason. The two produce different gaps.
 
         The api layer is tried first and the web layer only if it comes back
-        empty. CargoWareX's api tree is not mirrored on the host; its Vue app
-        is, and "this page already calls POST /mdm/airport/queryList" is still
-        evidence about existing behaviour.
+        empty. The front end is also the label dictionary: a Chinese ticket
+        reaches an English controller through the product's own zh-CN/en-US
+        pairs, so an empty api answer means the code was searched, not that the
+        words were untranslatable.
         """
 
         source = dict(ctx.source_repo or {})

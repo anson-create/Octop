@@ -15,10 +15,13 @@ Deliberately narrow:
   a keyword sweep across every checkout. Reading CargoWare's Java for a
   CargoWareX ticket would produce confident, wrong "current behaviour".
 * It prefers the api layer, and falls back to the web layer when the api mirror
-  is absent. CargoWareX's api tree is not mirrored on the host; its Vue app is,
-  and "which page and which endpoint does this ticket touch" is answerable from
-  the front end alone — a page that calls ``/mdm/airport/queryList`` is a fact
+  is absent. The front end still answers "which page and which endpoint does
+  this ticket touch" — a page that calls ``/mdm/airport/queryList`` is a fact
   about existing behaviour even without the Java behind it.
+* It reads the front end's own Chinese/English label pairs to get from a Chinese
+  ticket to the English identifiers the Java is built from (``空港`` →
+  ``Airport``). Searching an English api mirror with Chinese words returned "no
+  existing implementation" for features that shipped years ago.
 * It returns *structure* — mapping paths, method signatures, class names, route
   paths, endpoint calls — not whole files. A controller is 300 lines; the part
   that matters is four.
@@ -33,6 +36,7 @@ files, which is where the summary comes from.
 
 from __future__ import annotations
 
+import math
 import re
 import subprocess
 from collections.abc import Sequence
@@ -66,6 +70,9 @@ _STOPWORDS = frozenset(
         "实现",
         "增加",
         "优化",
+        # 智能 is the modifier of the decade: 智能派单 / 智能识别 / 智能客服.
+        # As a search term it selected OCR controllers for a dispatch ticket.
+        "智能",
         "The",
         # Product names appear in every file of the product's own repository.
         # Matching "CargoWare" in a CargoWareX ticket selects the whole tree.
@@ -111,6 +118,101 @@ _API_IMPORT = re.compile(r"from\s+['\"]@/api/([^'\"]+)['\"]")
 
 _MAX_TERMS = 8
 _MAX_READS = 60
+
+# --- Chinese label -> English identifier -------------------------------------
+#
+# A ticket says 港口管理; the Java says ``PortController``. The Chinese string
+# appears nowhere in an api mirror that was written in English, so grep comes
+# back empty for a page the product has shipped for years — which is exactly the
+# CCTOWER failure mode: every CargoWareX ticket "had no existing implementation".
+#
+# The product maintains its own dictionary. ``src/i18n/modules/zh-CN/<module>.ts``
+# holds ``title: '港口管理'`` and ``en-US/<module>.ts`` holds ``title: 'Port
+# Management'`` at the same key. Reading the pair turns a Chinese title into the
+# English words the code is actually built from — no translation model, no
+# hand-written glossary to rot.
+_I18N_SUBDIR = ("src", "i18n", "modules")
+_TS_FIELD = re.compile(r"^(\s*)(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_$][\w$]*))\s*:\s*(.*)$")
+_CAMEL = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
+_WORD = re.compile(r"[A-Za-z][A-Za-z0-9]+")
+# Words that name the shape of a screen rather than anything on it. They come
+# from key segments (``pageTitle``, ``common.management``) and would each select
+# a few thousand Java files: ``grep -F List`` matches every method signature.
+_I18N_STRUCTURAL = frozenset(
+    {
+        "list",
+        "menu",
+        "info",
+        "detail",
+        "details",
+        "common",
+        "columns",
+        "column",
+        "table",
+        "page",
+        "form",
+        "field",
+        "fields",
+        "title",
+        "admin",
+        "management",
+        "manage",
+        "button",
+        "label",
+        "placeholder",
+        "structure",
+        "data",
+        "type",
+        "types",
+        "item",
+        "items",
+        "content",
+        "section",
+        "group",
+        "index",
+        "main",
+        "base",
+        "basic",
+        "other",
+        "more",
+        "new",
+        "edit",
+        "add",
+        "delete",
+        "save",
+        "cancel",
+        "operation",
+        "operations",
+        "action",
+        "actions",
+        "status",
+        "state",
+        "tab",
+        "tabs",
+        "modal",
+        "drawer",
+        "panel",
+        "toolbar",
+        "header",
+        "footer",
+        "search",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _I18nEntry:
+    """One label: the Chinese string, and its English twin at the same key."""
+
+    module: str
+    path: tuple[str, ...]
+    zh: str
+    en: str
+
+
+# Parsed once per mirror. The directory's newest mtime is the invalidation key:
+# re-stating 130 files on every lookup would cost more than the lookup.
+_I18N_CACHE: dict[str, tuple[float, tuple[_I18nEntry, ...]]] = {}
 
 
 @dataclass(frozen=True)
@@ -258,6 +360,217 @@ def _window_terms(text: str, limit: int) -> list[str]:
             if index < len(bucket):
                 ordered.append(bucket[index])
     return ordered[:limit]
+
+
+def _ts_comment(line: str) -> bool:
+    """Whole-line comments only: these dictionaries are prettier-formatted."""
+
+    return line.strip().startswith(("//", "/*", "*", "*/"))
+
+
+def _ts_literal(rest: str) -> str | None:
+    """The string literal at the start of *rest*, or ``None``."""
+
+    if not rest or rest[0] not in "'\"`":
+        return None
+    quote = rest[0]
+    end = rest.find(quote, 1)
+    if end < 1:
+        return None
+    return rest[1:end]
+
+
+def _parse_ts_module(text: str) -> list[tuple[tuple[str, ...], str]]:
+    """``(key path, value)`` for every ``key: 'literal'`` in a locale module.
+
+    Indentation is the nesting, because these files are machine-formatted with
+    two-space indent and one field per line. A full TypeScript parse would need
+    a parser for a file whose only construct is nested object literals; reading
+    the indent gets the same answer in twenty lines.
+    """
+
+    pairs: list[tuple[tuple[str, ...], str]] = []
+    stack: list[tuple[int, str]] = []
+    for raw in text.splitlines():
+        if _ts_comment(raw):
+            continue
+        match = _TS_FIELD.match(raw)
+        if match is None:
+            continue
+        indent = len(match.group(1))
+        key = match.group(2) or match.group(3) or match.group(4) or ""
+        rest = (match.group(5) or "").strip()
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        literal = _ts_literal(rest)
+        if literal is not None:
+            pairs.append((tuple(name for _depth, name in stack) + (key,), literal))
+        elif rest.startswith("{"):
+            stack.append((indent, key))
+    return pairs
+
+
+def _read_i18n(base: Path) -> tuple[_I18nEntry, ...]:
+    """Join ``zh-CN/<module>.ts`` with ``en-US/<module>.ts`` on the key path."""
+
+    zh_dir, en_dir = base / "zh-CN", base / "en-US"
+    if not zh_dir.is_dir():
+        return ()
+    entries: list[_I18nEntry] = []
+    for file in sorted(zh_dir.glob("*.ts")):
+        try:
+            chinese = _parse_ts_module(file.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        if not chinese:
+            continue
+        twin = en_dir / file.name
+        translated: dict[tuple[str, ...], str] = {}
+        if twin.is_file():
+            try:
+                translated = dict(
+                    _parse_ts_module(twin.read_text(encoding="utf-8", errors="replace"))
+                )
+            except OSError:
+                translated = {}
+        for path, value in chinese:
+            # Only Chinese labels need translating; the English file's own
+            # strings would otherwise become search terms for themselves.
+            if _CJK_RUN.search(value):
+                entries.append(_I18nEntry(file.stem, path, value, translated.get(path, "")))
+    return tuple(entries)
+
+
+def _load_i18n(root: Path | None) -> tuple[_I18nEntry, ...]:
+    if root is None:
+        return ()
+    base = root.joinpath(*_I18N_SUBDIR)
+    if not base.is_dir():
+        return ()
+    try:
+        stamp = max((item.stat().st_mtime for item in base.rglob("*.ts")), default=0.0)
+    except OSError:
+        stamp = 0.0
+    cached = _I18N_CACHE.get(str(base))
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    entries = _read_i18n(base)
+    _I18N_CACHE[str(base)] = (stamp, entries)
+    return entries
+
+
+def _entry_tokens(entry: _I18nEntry) -> dict[str, float]:
+    """English identifiers this one label implies, and how directly.
+
+    The English translation counts for more than the key's own segment: for
+    ``tabs.airport: '空港'`` the answer is "Airports" (the translation), and
+    "tabs" is where the string happens to sit in the file.
+    """
+
+    # Sample fixtures live in the same dictionaries (`mockData.airPort`) and
+    # would contribute Mock/Air to a real 空港 ticket.
+    if any(part.lower() in {"mock", "mockdata", "demo", "sample", "test"} for part in entry.path):
+        return {}
+
+    def keep(token: str) -> bool:
+        return (
+            len(token) >= 3
+            and not token.isdigit()
+            and token not in _I18N_STRUCTURAL
+        )
+
+    weights: dict[str, float] = {}
+    for name in entry.path:
+        for word in _CAMEL.findall(name):
+            token = word.lower()
+            if keep(token):
+                weights.setdefault(token, 0.7)
+    for word in _WORD.findall(entry.en):
+        token = word.lower()
+        if keep(token):
+            weights[token] = 1.0
+    return weights
+
+
+def _i18n_terms(root: Path | None, title: str, *, limit: int = 6) -> tuple[str, ...]:
+    """English identifiers for a Chinese title, taken from the product's labels.
+
+    The match runs **labels against the title**, not title words against labels:
+    every one of the 13k labels is checked for "is this label contained in the
+    title". Cutting the title into windows first produced pairs like
+    「管理列表」 that no label ever contains, and their misses dragged in noise
+    ("Title", "Admin") from a page-title string. A label that really appears in
+    the title is a fact about the screen; a window that lands between two words
+    is not.
+
+    Two filters keep the result usable:
+
+    * a label longer than the title or shorter than two characters is skipped;
+    * a token carried by more than 3% of all labels is product-wide vocabulary
+      ("Management", "Status") and is dropped — it selects a whole module.
+
+    The weights are inverse document frequency, so 空港 (a handful of labels)
+    outranks 状态 (hundreds of them), and label length, so 批量导出 beats 导出.
+    """
+
+    entries = _load_i18n(root)
+    if not entries:
+        return ()
+    head = (title or "").partition("\n")[0].strip()
+    if not head:
+        return ()
+    index: dict[str, int] = {}
+    entry_tokens: list[dict[str, float]] = []
+    label_freq: dict[str, int] = {}
+    for entry in entries:
+        tokens = _entry_tokens(entry)
+        entry_tokens.append(tokens)
+        label_freq[entry.zh] = label_freq.get(entry.zh, 0) + 1
+        for token in tokens:
+            index[token] = index.get(token, 0) + 1
+    total = max(len(entries), 1)
+    # Half a percent, not three: at three, 「状态」「启用」依然在册 and every
+    # ticket came back with the same six words. 68 of 13k labels is roughly the
+    # set that names one screen each. The floor of 4 keeps a small dictionary
+    # (a test fixture, or a minor product) from filtering out everything — a
+    # percentage of 14 entries rounds to zero.
+    ceiling = max(4.0, total * 0.005)
+
+    scores: dict[str, float] = {}
+    for position, entry in enumerate(entries):
+        label = entry.zh
+        if not 2 <= len(label) <= 12 or label not in head:
+            continue
+        # A label the product reuses everywhere describes no screen. 「状态」 is
+        # the zh string of `test.status`, `oncarriage.labels.status`,
+        # `queryOperator` … and each of those paths contributed its own token
+        # (Test, Oncarriage, Between) for a ticket that said nothing about them.
+        if label_freq[label] > (20 if len(label) >= 3 else 6):
+            continue
+        # A four-character label names something; a two-character one is usually
+        # a fragment of a longer name that is also in the title.
+        weight = len(label) / 4.0
+        if label == head:
+            weight *= 2.0
+        for token, directness in entry_tokens[position].items():
+            if index[token] > ceiling:
+                continue
+            idf = math.log(1.0 + total / (1.0 + index[token]))
+            score = weight * directness * idf
+            # Best single label, not the sum over matching labels. Summing made
+            # 「启用」 win every ticket: it appears in a dozen labels, each
+            # adding a little, and pushed out the one label that actually named
+            # the screen (「空港」).
+            if score > scores.get(token, 0.0):
+                scores[token] = score
+
+    ranked = sorted(scores.items(), key=lambda pair: (-pair[1], pair[0]))
+    # Capitalised on purpose. Grep here is case sensitive, and the lower-case
+    # form of a short word is a substring of the import block: a query for
+    # ``port`` selects every Java file that ever wrote ``import``. The
+    # class-name form (``Airport``) matches ``AirportController`` and
+    # ``queryAirportList`` while matching nothing in an import statement.
+    return tuple(token[:1].upper() + token[1:] for token, _score in ranked[:limit])
 
 
 def _grep_files(root: Path, terms: tuple[str, ...], suffixes: tuple[str, ...], timeout_s: float) -> list[Path]:
@@ -780,6 +1093,7 @@ def search_repo(
     *,
     limit: int = 6,
     timeout_s: float = 20.0,
+    extra_terms: Sequence[str] = (),
 ) -> SourceDigest:
     """Existing implementations that touch this requirement, or a stated reason."""
 
@@ -790,12 +1104,22 @@ def search_repo(
             layer=spec.layer,
             reason=f"镜像未同步：{root} 不存在（先同步源码再重新取证）",
         )
-    terms = query_terms(query)
+    # Chinese words find the front end (labels are Chinese) and the English
+    # identifiers find the Java (class names are English). Searching with one
+    # half of that pair is why an api mirror of 9500 files answered "no hits".
+    terms = tuple(dict.fromkeys(query_terms(query) + tuple(extra_terms)))
+    # The English words widen the recall net (the Java says ``Inquiry``, the
+    # ticket says 询价) but they must not decide the ranking: a ticket about 询价
+    # forms matched Vendor + Registry in the brand-new dispatch module and the
+    # two English hits outscored the one Chinese hit that actually named the
+    # feature. Ranking stays on Chinese evidence; English only widens the net.
+    scoring = tuple(term for term in terms if _CJK_RUN.search(term)) or terms
     if not terms:
         return SourceDigest(
             repo=spec.key, layer=spec.layer, reason="需求原文里没有可用于检索的业务词"
         )
 
+    suffixes: tuple[str, ...]
     if spec.framework == FRAMEWORK_JAVA:
         suffixes = ("*.java",)
     elif spec.layer == "web":
@@ -814,7 +1138,7 @@ def search_repo(
 
     # Read the shortlist only. 600 files can match "供应商"; reading all of them
     # would cost more than the answer is worth.
-    ranked = sorted(files, key=lambda item: -_path_score(str(item), terms))[:_MAX_READS]
+    ranked = sorted(files, key=lambda item: -_path_score(str(item), scoring))[:_MAX_READS]
     hits: list[SourceHit] = []
     texts: dict[str, str] = {}
     for path in ranked:
@@ -826,12 +1150,12 @@ def search_repo(
             continue
         relative = str(path).replace(str(root).rstrip("/") + "/", "")
         excerpt, span = _excerpt_for(
-            spec, text, terms, name=_display_name(relative), path=relative
+            spec, text, scoring, name=_display_name(relative), path=relative
         )
         if not excerpt:
             continue
         texts[relative] = text
-        score = _keyword_score(text, relative, terms)
+        score = _keyword_score(text, relative, scoring)
         hits.append(
             SourceHit(
                 repo=spec.key,
@@ -847,10 +1171,10 @@ def search_repo(
         # A page that matched only 表单 is not evidence of anything — every form
         # in the product matches it. Drop those when something better exists,
         # rather than padding the list to six.
-        specific = [hit for hit in hits if _is_specific(texts.get(hit.path, ""), terms)]
+        specific = [hit for hit in hits if _is_specific(texts.get(hit.path, ""), scoring)]
         if specific:
             hits = specific
-        hits.extend(_follow_routes(root, hits, texts, terms))
+        hits.extend(_follow_routes(root, hits, texts, scoring))
 
     if not hits:
         return SourceDigest(
@@ -896,10 +1220,19 @@ def search_requirement(
 
     if not specs:
         return None
+    # The front end is where the Chinese labels live, so it is the dictionary
+    # for the api layer even when the api layer is the one being searched.
+    dictionary = next(
+        (spec.root() for spec in specs if spec.layer == "web" and spec.root().is_dir()),
+        None,
+    )
+    extra = _i18n_terms(dictionary, query)
     notes: list[str] = []
     first: SourceDigest | None = None
     for spec in specs:
-        digest = search_repo(spec, query, limit=limit, timeout_s=timeout_s)
+        digest = search_repo(
+            spec, query, limit=limit, timeout_s=timeout_s, extra_terms=extra
+        )
         if digest.ok:
             return replace(digest, skipped=tuple(notes))
         notes.append(f"{spec.key}：{digest.reason}")

@@ -477,3 +477,164 @@ def test_the_endpoint_quoted_is_the_one_whose_comment_matches(tmp_path: Path) ->
     excerpt = digest.hits[0].excerpt
     assert "/price/inquiry/save" in excerpt
     assert "/price/fcl/page" not in excerpt
+
+
+# --- the product's own label dictionary -------------------------------------
+#
+# The failure being tested: a CCTOWER ticket is written in Chinese, the api
+# mirror is written in English, and the lookup answered "no existing
+# implementation" for pages that had shipped for years.
+
+PORT_ZH = """// 港口管理模块中文翻译
+export default {
+  // 页面标题
+  title: '港口管理',
+  pageTitle: '港口管理 - 平台管理后台',
+  tabs: {
+    seaport: '海港',
+    airport: '空港'
+  },
+  search: {
+    status: '状态',
+    statusPlaceholder: '选择状态'
+  },
+  status: {
+    enabled: '启用',
+    disabled: '禁用'
+  },
+  actions: {
+    addAirport: '新增空港',
+    batchEnable: '批量启用'
+  }
+}
+"""
+
+PORT_EN = """export default {
+  title: 'Port Management',
+  pageTitle: 'Port Management - Platform Admin',
+  tabs: {
+    seaport: 'Seaports',
+    airport: 'Airports'
+  },
+  search: {
+    status: 'Status',
+    statusPlaceholder: 'Select status'
+  },
+  status: {
+    enabled: 'Enabled',
+    disabled: 'Disabled'
+  },
+  actions: {
+    addAirport: 'Add airport',
+    batchEnable: 'Bulk enable'
+  }
+}
+"""
+
+AIRPORT_CONTROLLER = """package com.walltech.control.tower.mdm.controller;
+
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/mdm/airport")
+public class AirportController {
+
+    @PostMapping("queryList")
+    public Result<PageInfo<AirportVO>> queryAirportList(@RequestBody AirportQuery request) {
+        return Result.ok(null);
+    }
+
+    @PostMapping("enable")
+    public Result<Void> setEnabled(@RequestBody AirportEnableRequest request) {
+        return Result.ok(null);
+    }
+}
+"""
+
+
+def test_a_chinese_title_reaches_the_english_controller_through_the_labels(
+    tmp_path: Path,
+) -> None:
+    api_root = tmp_path / "cwx-api"
+    web_root = tmp_path / "cwx-web"
+    _write(
+        api_root,
+        "mdm-service/src/main/java/com/walltech/control/tower/mdm/controller/AirportController.java",
+        AIRPORT_CONTROLLER,
+    )
+    _write(web_root, "src/i18n/modules/zh-CN/port.ts", PORT_ZH)
+    _write(web_root, "src/i18n/modules/en-US/port.ts", PORT_EN)
+
+    digest = search_requirement(
+        [_spec(api_root, "cwx-api"), _web_spec(web_root)], "空港管理新增启用状态筛选"
+    )
+
+    assert digest is not None
+    assert digest.ok
+    # The api layer answers, not the front end: it was only reached because the
+    # label dictionary turned 空港 into a word the Java actually uses.
+    assert digest.layer == "api"
+    assert "Airport" in digest.terms
+    assert "AirportController" in digest.hits[0].path
+
+
+def test_the_dictionary_is_read_from_the_front_end_not_the_api_mirror(
+    tmp_path: Path,
+) -> None:
+    """A locale file inside the api mirror is not a dictionary."""
+
+    api_root = tmp_path / "cwx-api"
+    _write(api_root, "src/i18n/modules/zh-CN/port.ts", PORT_ZH)
+    _write(api_root, "src/i18n/modules/en-US/port.ts", PORT_EN)
+
+    digest = search_requirement([_spec(api_root, "cwx-api")], "空港管理新增启用状态筛选")
+
+    assert digest is not None
+    assert not digest.ok
+    assert "Airport" not in digest.terms
+
+
+def test_a_label_shared_by_the_whole_product_is_not_a_search_term(tmp_path: Path) -> None:
+    """80 labels say 说明; a query for it identifies no feature, so nothing is
+    invented to grep for."""
+
+    web_root = tmp_path / "cwx-web"
+    lines = "\n".join(f"    k{index}: '说明{index}'" for index in range(80))
+    _write(
+        web_root,
+        "src/i18n/modules/zh-CN/common.ts",
+        f"export default {{\n  broadcast: {{\n{lines}\n  }}\n}}\n",
+    )
+    _write(
+        web_root,
+        "src/i18n/modules/en-US/common.ts",
+        f"export default {{\n  broadcast: {{\n{lines.replace('说明', 'Note ')}\n  }}\n}}\n",
+    )
+
+    digest = search_requirement([_web_spec(web_root)], "说明")
+
+    assert digest is not None
+    assert digest.terms == query_terms("说明")
+
+
+def test_a_matched_label_still_reads_when_the_english_twin_is_missing(tmp_path: Path) -> None:
+    """Only zh-CN was synced: the key names still carry English identifiers."""
+
+    api_root = tmp_path / "cwx-api"
+    web_root = tmp_path / "cwx-web"
+    _write(
+        api_root,
+        "mdm-service/src/main/java/com/walltech/control/tower/mdm/controller/AirportController.java",
+        AIRPORT_CONTROLLER,
+    )
+    _write(web_root, "src/i18n/modules/zh-CN/port.ts", PORT_ZH)
+
+    digest = search_requirement(
+        [_spec(api_root, "cwx-api"), _web_spec(web_root)], "空港管理新增启用状态筛选"
+    )
+
+    assert digest is not None
+    assert digest.ok
+    assert "Airport" in digest.terms
