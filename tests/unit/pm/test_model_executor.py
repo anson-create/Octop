@@ -381,3 +381,136 @@ def test_deterministic_executor_still_wins_its_own_steps() -> None:
     assert registry.supports("intake")
     out = registry.run(_ctx("intake"))
     assert out.artifact is not None and out.artifact["origin"] == "rule"
+
+
+# --- the api mirror is what makes "现状" a fact rather than a memory -------
+
+_BILLING_CONTROLLER = '''package com.walltech.cargo.controller;
+
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+/** 账单列表：代收垫付费用查询 */
+@RestController
+@RequestMapping("/billing")
+public class BillingController {
+
+    @PostMapping("list")
+    public Result<PageInfo<QueryBillingListVO>> queryBillingList(
+            @RequestBody @Valid QueryBillingListRequest request) {
+        return Result.ok(null);
+    }
+}
+'''
+
+
+def _cw_api_mirror(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point cw-api at a throwaway mirror; the real one only exists in prod."""
+
+    from octop.infra.pm.domain.repos import FRAMEWORK_JAVA, REPOS, RepoSpec
+
+    root = tmp_path / "cw-api"
+    file = (
+        root
+        / "act-service/src/main/java/com/walltech/cargo/controller/BillingController.java"
+    )
+    file.parent.mkdir(parents=True, exist_ok=True)
+    file.write_text(_BILLING_CONTROLLER, encoding="utf-8")
+    monkeypatch.setitem(
+        REPOS,
+        "cw-api",
+        RepoSpec(
+            key="cw-api",
+            system="cargoware",
+            layer="api",
+            framework=FRAMEWORK_JAVA,
+            mirror=str(root),
+        ),
+    )
+
+
+def _billing_ctx(step_key: str) -> StepContext:
+    """A ticket whose vocabulary the fake mirror actually contains."""
+
+    return _ctx(
+        step_key,
+        source_repo={"api_repo": "cw-api"},
+        requirement_title="账单列表增加代收垫付外币关联",
+        requirement_text="代收垫付需要支持外币与人民币自动关联，账单列表要能筛出来。",
+    )
+
+
+def test_code_probe_cites_the_api_source_instead_of_guessing(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cw_api_mirror(tmp_path, monkeypatch)
+
+    out = _executor().run(_billing_ctx("code"))
+
+    # A real file and a real line range, so the claim can be checked.
+    spans = [item for item in out.evidence if item.get("source_type") == "code"]
+    assert spans, out.evidence
+    assert spans[0]["locator"]["kind"] == "code_span"
+    assert spans[0]["locator"]["path"].endswith("BillingController.java")
+    assert "queryBillingList" in spans[0]["excerpt"]
+    # Not "代码取证（推断）" any more: there was something to read.
+    assert out.artifact is not None and out.artifact["title"] == "代码取证"
+    assert out.trace["source_hits"] == 1
+
+
+def test_code_probe_says_why_it_could_not_look(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from octop.infra.pm.domain.repos import FRAMEWORK_JAVA, REPOS, RepoSpec
+
+    # Mapped, but the mirror was never synced: a different fact from "no match",
+    # and the one an operator has to act on.
+    monkeypatch.setitem(
+        REPOS,
+        "cw-api",
+        RepoSpec(
+            key="cw-api",
+            system="cargoware",
+            layer="api",
+            framework=FRAMEWORK_JAVA,
+            mirror=str(tmp_path / "never-synced"),
+        ),
+    )
+
+    out = _executor().run(_billing_ctx("code"))
+
+    assert out.artifact is not None and out.artifact["title"] == "代码取证（推断）"
+    assert any("镜像未同步" in gap for gap in out.gaps), out.gaps
+    assert not [item for item in out.evidence if item.get("source_type") == "code"]
+
+
+def test_prd_writes_an_existing_implementation_section_from_the_source(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cw_api_mirror(tmp_path, monkeypatch)
+
+    factory = FakeFactory()
+    prompts: list[str] = []
+    original = factory._access.ainvoke_text
+
+    async def recording(prompt: str, **kwargs: Any) -> str:
+        prompts.append(prompt)
+        return await original(prompt, **kwargs)
+
+    factory._access.ainvoke_text = recording  # type: ignore[method-assign]
+    executor = ModelStepExecutor(models_provider=lambda: factory)
+
+    out = executor.run(_prd_ctx())
+
+    # The prompt is where the fact enters: the model cannot cite an endpoint it
+    # was never shown, and the artifact body is scripted in this test.
+    assert "POST /billing/list" in prompts[-1]
+    assert "现有实现" in prompts[-1]
+    assert any(item.get("source_type") == "code" for item in out.evidence)
+    assert any("现有实现" in item["text"] for item in out.conclusions)
+    assert out.trace["source_hits"] == 1
+
+
+def _prd_ctx() -> StepContext:
+    return _billing_ctx("prd")

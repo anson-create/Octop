@@ -1126,6 +1126,7 @@ class PMService:
             }
 
         web = binding.web
+        api = binding.api
         return {
             "project": project,
             "mapped": True,
@@ -1136,6 +1137,12 @@ class PMService:
             "mirror": web.mirror if web is not None else "",
             "mirror_ready": bool(web is not None and web.root().is_dir()),
             "framework": web.framework if web is not None else "",
+            # The api mirror is what the PRD's 现状 section and the code probe
+            # read. Reported here too, so "why did the PRD say nothing about
+            # existing endpoints" has an answer that is not a guess.
+            "api_repo": api.key if api is not None else "",
+            "api_mirror": api.mirror if api is not None else "",
+            "api_mirror_ready": bool(api is not None and api.root().is_dir()),
             "reason": binding.describe(),
         }
 

@@ -27,6 +27,7 @@ from collections.abc import Callable
 from typing import Any
 
 from octop.infra.pm.domain.repos import REPOS
+from octop.infra.pm.domain.source_index import SourceDigest, search_repo
 from octop.infra.pm.runtime.executor import (
     ExecutorUnavailable,
     StepContext,
@@ -344,6 +345,46 @@ class ModelStepExecutor:
             confidence=0.6,
         )
 
+    def _source_lookup(self, ctx: StepContext) -> SourceDigest | None:
+        """What the product already does, from the api layer's own source.
+
+        ``None`` means this requirement is not mapped to an api repository at
+        all — a different fact from "mapped, but nothing matched", which comes
+        back as a digest carrying the reason. The two produce different gaps.
+        """
+
+        source = dict(ctx.source_repo or {})
+        spec = REPOS.get(str(source.get("api_repo") or ""))
+        if spec is None:
+            return None
+        return search_repo(spec, f"{ctx.requirement_title}\n{ctx.requirement_text}")
+
+    def _source_evidence(
+        self, digest: SourceDigest | None, *, limit: int = 4
+    ) -> list[dict[str, Any]]:
+        """Code hits as citable spans: a real file, a real line range.
+
+        Only called with a digest that produced hits — an empty digest must not
+        become an empty-but-present evidence entry that reads like a check.
+        """
+
+        if digest is None or not digest.ok:
+            return []
+        return [
+            _envelope(
+                source_type="code",
+                locator={
+                    "kind": "code_span",
+                    "repo": hit.repo,
+                    "path": hit.path,
+                    "lines": hit.lines,
+                },
+                excerpt=_clip(hit.excerpt),
+                confidence=0.85,
+            )
+            for hit in digest.hits[:limit]
+        ]
+
     def _data_artifact(
         self,
         *,
@@ -454,22 +495,68 @@ class ModelStepExecutor:
         )
 
     def _code(self, ctx: StepContext) -> StepOutput:
-        payload = self._ask_json(
-            system=_BASE_SYSTEM,
-            user=(
-                "任务：说出这条需求会触及的代码面（页面、接口、数据读写），并明确标注哪些是推断。\n"
-                f"需求标题：{ctx.requirement_title}\n需求原文：{ctx.requirement_text}\n\n"
-                "输出 JSON：\n"
-                '{"touchpoints":[{"area":"模块或页面","change":"要改什么","confidence":"high|medium|low",'
-                '"basis":"依据的原文"}],"gaps":["需要代码库才能确认的点"]}\n'
-                "你当前没有代码库访问权限，所以 touchpoints 只能是推断，gaps 必须列出这一点。"
-            ),
-            required=("touchpoints", "gaps"),
-        )
-        points = [item for item in payload.get("touchpoints") or [] if isinstance(item, dict)]
-        gaps = [str(item) for item in payload.get("gaps") or [] if str(item).strip()]
-        if not any("代码" in gap for gap in gaps):
-            gaps.insert(0, "未接入代码库端口：以下代码面结论均为模型推断，需研发复核")
+        """Code probe, grounded in the api layer's own source when it is there.
+
+        The step used to tell the model "you have no access to the codebase", so
+        every touchpoint was an inference dressed as a finding. It now reads the
+        mapped api mirror first and puts real mapping paths in front of the
+        model. When there is no mirror — or no match — it still runs, but says
+        which of those happened instead of implying a check took place.
+        """
+
+        digest = self._source_lookup(ctx)
+        facts = digest.render() if digest is not None and digest.ok else ""
+
+        if facts:
+            payload = self._ask_json(
+                system=_BASE_SYSTEM,
+                user=(
+                    "任务：说出这条需求会触及的代码面（页面、接口、数据读写），"
+                    "并明确标注哪些是推断。\n"
+                    f"需求标题：{ctx.requirement_title}\n需求原文：{ctx.requirement_text}\n\n"
+                    f"现网已有的实现（从 {digest.repo} 源码静态检索得出，接口与文件可直接引用）：\n"
+                    f"{facts}\n\n"
+                    "输出 JSON：\n"
+                    '{"touchpoints":[{"area":"模块或页面","change":"要改什么",'
+                    '"confidence":"high|medium|low",'
+                    '"basis":"依据：引用上面的接口路径或文件行，或需求原文"}],'
+                    '"gaps":["需要读更多代码或跑起来才能确认的点"]}\n'
+                    "凡是与上面既有实现相关的 touchpoint，basis 必须写清对应哪个接口或文件；"
+                    "没有依据的一律标 low 并写进 gaps。不要编造库里不存在的接口名。"
+                ),
+                required=("touchpoints", "gaps"),
+            )
+            points = [item for item in payload.get("touchpoints") or [] if isinstance(item, dict)]
+            gaps = [str(item) for item in payload.get("gaps") or [] if str(item).strip()]
+            gaps.insert(0, "代码面结论来自源码静态检索（未运行验证），需研发复核")
+            note = (
+                f"按 {digest.repo} 源码检索到 {len(digest.hits)} 处既有实现取证"
+                f"（候选 {digest.candidates} 个文件），未运行验证。"
+            )
+            sources = ["requirement", "code"]
+        else:
+            payload = self._ask_json(
+                system=_BASE_SYSTEM,
+                user=(
+                    "任务：说出这条需求会触及的代码面（页面、接口、数据读写），并明确标注哪些是推断。\n"
+                    f"需求标题：{ctx.requirement_title}\n需求原文：{ctx.requirement_text}\n\n"
+                    "输出 JSON：\n"
+                    '{"touchpoints":[{"area":"模块或页面","change":"要改什么","confidence":"high|medium|low",'
+                    '"basis":"依据的原文"}],"gaps":["需要代码库才能确认的点"]}\n'
+                    "你当前没有代码库访问权限，所以 touchpoints 只能是推断，gaps 必须列出这一点。"
+                ),
+                required=("touchpoints", "gaps"),
+            )
+            points = [item for item in payload.get("touchpoints") or [] if isinstance(item, dict)]
+            gaps = [str(item) for item in payload.get("gaps") or [] if str(item).strip()]
+            if not any("代码" in gap for gap in gaps):
+                gaps.insert(0, "未接入代码库端口：以下代码面结论均为模型推断，需研发复核")
+            # Carry the real blocker into the gap, so "nothing found" and "could
+            # not look" do not read the same to whoever picks this up.
+            if digest is not None and digest.reason:
+                gaps.insert(0, f"源码检索未产出依据：{digest.reason}")
+            note = "未接入代码库端口，代码面结论为模型推断。"
+            sources = ["requirement"]
 
         evidence = [self._cite_requirement(ctx)]
         for item in points[:4]:
@@ -481,27 +568,46 @@ class ModelStepExecutor:
                     confidence=0.4,
                 )
             )
+        evidence.extend(self._source_evidence(digest))
+
+        conclusions = [
+            {
+                "text": f"推断触及 {len(points)} 处代码面，全部待研发复核。",
+                "status": "evidenced",
+                "evidence_indexes": [0],
+            }
+        ]
+        if facts:
+            conclusions.append(
+                {
+                    "text": f"其中 {len(digest.hits)} 处既有接口/类来自 {digest.repo} 源码，可逐条核对。",
+                    "status": "evidenced",
+                    "evidence_indexes": list(
+                        range(1 + min(len(points), 4), 1 + min(len(points), 4) + len(digest.hits[:4]))
+                    ),
+                }
+            )
+        conclusions.append({"text": "代码侧事实未经运行验证。", "status": "undetermined"})
+
         return StepOutput(
             status="passed",
             artifact=self._data_artifact(
-                title="代码取证（推断）",
-                payload={"touchpoints": points, "gaps": gaps},
-                fidelity_note="未接入代码库端口，代码面结论为模型推断。",
-            ),
-            conclusions=[
-                {
-                    "text": f"推断触及 {len(points)} 处代码面，全部待研发复核。",
-                    "status": "evidenced",
-                    "evidence_indexes": [0],
+                title="代码取证" if facts else "代码取证（推断）",
+                payload={
+                    "touchpoints": points,
+                    "gaps": gaps,
+                    "existing": digest.as_dict() if facts else None,
                 },
-                {"text": "代码侧事实未经仓库核对。", "status": "undetermined"},
-            ],
+                fidelity_note=note,
+            ),
+            conclusions=conclusions,
             evidence=evidence,
             gaps=gaps,
             trace={
-                "sources": ["requirement"],
-                "tool_calls": ["model.code_probe"],
+                "sources": sources,
+                "tool_calls": ["source.search", "model.code_probe"] if facts else ["model.code_probe"],
                 "touchpoints": len(points),
+                "source_hits": len(digest.hits) if digest is not None else 0,
             },
         )
 
@@ -1273,16 +1379,40 @@ class ModelStepExecutor:
         )
 
     def _prd(self, ctx: StepContext) -> StepOutput:
+        """The PRD, written with the existing implementation in view.
+
+        Without this the "现状" was whatever the model remembered, and features
+        that already shipped were re-specified as new work. The lookup supplies
+        mapping paths and class names; the prompt forbids rewriting them.
+        """
+
         analysis = self._latest_document(ctx)
+        digest = self._source_lookup(ctx)
+        facts = digest.render() if digest is not None and digest.ok else ""
+
+        structure = (
+            "结构必须包含：背景与目标 / 现有实现（本次需求涉及的既有接口与页面，逐条写上接口路径）"
+            " / 范围（含不做什么）/ 用户流程 / 功能清单（含优先级）/ 验收标准 / 边界与异常 / 依赖与风险。"
+            if facts
+            else "结构必须包含：背景与目标 / 范围（含不做什么）/ 用户流程 / 功能清单（含优先级）"
+            " / 验收标准 / 边界与异常 / 依赖与风险。"
+        )
+        existing = (
+            f"现网已有的实现（源码静态检索得出，是「现有实现」小节的依据）：\n{facts}\n\n" if facts else ""
+        )
+        citation = (
+            "引用既有接口时必须照抄上面的路径，不要改写路径，也不要新造库里没有的接口名。"
+            if facts
+            else ""
+        )
+
         text = self._ask(
             system=_BASE_SYSTEM + " 这次输出 markdown 正文，不要 JSON，不要外层代码块。",
             user=(
                 "任务：写这份需求的 PRD，面向研发与测试，要求可直接排期实施。\n"
                 f"需求标题：{ctx.requirement_title}\n需求原文：{ctx.requirement_text}\n"
                 f"需求分析：{analysis[:1500]}\n\n"
-                "结构必须包含：背景与目标 / 范围（含不做什么）/ 用户流程 / 功能清单（含优先级）"
-                " / 验收标准 / 边界与异常 / 依赖与风险。"
-                "每一条功能都要能对应到验收标准，不要写空话。"
+                f"{existing}{structure}每一条功能都要能对应到验收标准，不要写空话。{citation}"
             ),
         )
         body = _strip_fence(_strip_thinking(text)).strip()
@@ -1296,28 +1426,52 @@ class ModelStepExecutor:
                 confidence=0.6,
             )
         ]
+        evidence.extend(self._source_evidence(digest, limit=3))
+
+        gaps = ["PRD 未经过产品与研发评审"]
+        if digest is not None and not digest.ok:
+            # Naming the blocker is the difference between "we checked twice and
+            # found nothing" and "there was nothing to check against".
+            gaps.append(f"PRD 未引用现网实现：{digest.reason}")
+
+        conclusions = [
+            {
+                "text": "PRD 覆盖背景、范围、功能清单、验收标准、边界与风险七个部分。",
+                "status": "evidenced",
+                "evidence_indexes": [0],
+            },
+            {"text": "PRD 中的工作量与排期未经研发确认。", "status": "undetermined"},
+        ]
+        if facts:
+            conclusions.insert(
+                1,
+                {
+                    "text": f"「现有实现」小节依据 {len(digest.hits)} 处源码检索结果（{digest.repo}）。",
+                    "status": "evidenced",
+                    "evidence_indexes": [0],
+                },
+            )
+
         return StepOutput(
             status="passed",
             artifact=self._doc_artifact(
                 title="PRD",
                 body=body,
-                fidelity_note="模型起草，未经过产品与研发评审。",
+                fidelity_note=(
+                    "模型起草，未经产品与研发评审；现有实现来自源码静态检索。"
+                    if facts
+                    else "模型起草，未经过产品与研发评审。"
+                ),
                 audience="internal",
             ),
-            conclusions=[
-                {
-                    "text": "PRD 覆盖背景、范围、功能清单、验收标准、边界与风险七个部分。",
-                    "status": "evidenced",
-                    "evidence_indexes": [0],
-                },
-                {"text": "PRD 中的工作量与排期未经研发确认。", "status": "undetermined"},
-            ],
+            conclusions=conclusions,
             evidence=evidence,
-            gaps=["PRD 未经过产品与研发评审"],
+            gaps=gaps,
             trace={
-                "sources": ["requirement", "pm_analysis"],
-                "tool_calls": ["model.prd"],
+                "sources": ["requirement", "pm_analysis", "code"] if facts else ["requirement", "pm_analysis"],
+                "tool_calls": ["source.search", "model.prd"] if facts else ["model.prd"],
                 "chars": len(body),
+                "source_hits": len(digest.hits) if digest is not None else 0,
             },
         )
 

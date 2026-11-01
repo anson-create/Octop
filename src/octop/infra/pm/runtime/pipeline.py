@@ -337,6 +337,7 @@ class Pipeline:
                 "reason": f"Jira 项目 {project} 未映射到源码仓库",
             }
         web = binding.web
+        api = binding.api
         return {
             "project": project,
             "mapped": True,
@@ -346,6 +347,12 @@ class Pipeline:
             "web_repo": web.key if web is not None else "",
             "mirror": web.mirror if web is not None else "",
             "mirror_ready": bool(web is not None and web.root().is_dir()),
+            # The api layer answers "what already exists" for the code probe and
+            # the PRD's 现状 section; it cannot be rendered, so it is kept
+            # separate from the prototype's web repo rather than replacing it.
+            "api_repo": api.key if api is not None else "",
+            "api_mirror": api.mirror if api is not None else "",
+            "api_mirror_ready": bool(api is not None and api.root().is_dir()),
         }
 
     def _locate_evidence(self, requirement: Any) -> Any:
