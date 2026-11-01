@@ -110,6 +110,21 @@ async def jira_issues(
     return pm.list_jira_issues(workspace_id, q=q, limit=limit)
 
 
+@router.get("/jira/meta", summary="Statuses and priorities this site actually uses")
+async def jira_meta(
+    workspace_id: int,
+    pm: PMService = Depends(get_pm),
+    _: Any = Depends(require_permission("pm")),
+) -> dict[str, Any]:
+    """What the default queue filter may legally say here.
+
+    The queue defaults to "待设计 / P0,P1", which is this product's guess about
+    a Jira site it does not own. When the guess is wrong the operator faces a
+    400 they cannot act on; this returns the real names and which defaults hit.
+    """
+    return pm.jira_meta(workspace_id)
+
+
 @router.get("/jira/issue/{issue_key}", summary="Read one issue in full, before importing")
 async def jira_issue(
     issue_key: str,

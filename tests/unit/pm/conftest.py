@@ -112,6 +112,11 @@ class FakeJiraClient:
         self.closed = False
         self.issues = {key: dict(value) for key, value in _FAKE_ISSUES.items()}
         self.calls: list[tuple[str, str]] = []
+        # Set to a JQL fragment to make `search` answer the way a real site does
+        # when the queue filter names a status it does not have: HTTP 400.
+        self.reject_jql = ""
+        self.status_names = ["待设计", "开发中", "已完成"]
+        self.priority_names = ["P0", "P1", "P2"]
 
     def __enter__(self) -> FakeJiraClient:
         return self
@@ -142,8 +147,22 @@ class FakeJiraClient:
         return payload
 
     def search(self, jql: str, *, limit: int = 20) -> list[dict]:
+        from octop.infra.pm.ports.jira import JiraError
+
         self.calls.append(("search", jql))
+        if self.reject_jql and self.reject_jql in jql:
+            raise JiraError(
+                'Jira 返回 400：["The value \'待设计\' does not exist for the field \'status\'."]'
+            )
         return [dict(item) for item in list(self.issues.values())[:limit]]
+
+    def statuses(self) -> list[str]:
+        self.calls.append(("statuses", ""))
+        return list(self.status_names)
+
+    def priorities(self) -> list[str]:
+        self.calls.append(("priorities", ""))
+        return list(self.priority_names)
 
     def probe(self) -> dict:
         return {

@@ -118,6 +118,32 @@ DEFAULT_JQL = (
     "ORDER BY updated DESC"
 )
 
+# The design backlog this product opens onto: mine, waiting to be designed, and
+# urgent. Both names are *defaults*, not laws — the instance is the authority on
+# what its statuses and priorities are called, so they are overridable per
+# workspace and ``list_jira_issues`` falls back to DEFAULT_JQL (with a note)
+# rather than showing an error the operator cannot act on.
+INTAKE_STATUSES = ("待设计",)
+INTAKE_PRIORITIES = ("P0", "P1")
+
+
+def _quoted(values: tuple[str, ...]) -> str:
+    return ", ".join(f'"{value}"' for value in values)
+
+
+def intake_jql(
+    statuses: tuple[str, ...] = INTAKE_STATUSES,
+    priorities: tuple[str, ...] = INTAKE_PRIORITIES,
+) -> str:
+    """The default queue. An empty axis means "do not filter on it"."""
+
+    parts = ["assignee = currentUser()"]
+    if statuses:
+        parts.append(f"status in ({_quoted(statuses)})")
+    if priorities:
+        parts.append(f"priority in ({_quoted(priorities)})")
+    return " AND ".join(parts) + " ORDER BY updated DESC"
+
 
 class JiraError(PortError):
     """A Jira call failed in a way the caller must surface."""
@@ -448,6 +474,39 @@ class JiraClient:
             )
         result.sort(key=lambda item: item["name"])
         return result
+
+    def statuses(self) -> list[str]:
+        """Status names this instance actually uses.
+
+        The intake queue is written in status terms ("待设计"), and every Jira
+        site spells those for itself. Reading the real list turns a mismatched
+        filter from an opaque HTTP 400 into a one-glance comparison in the UI.
+        """
+
+        payload = self._request("GET", "/rest/api/2/status")
+        if not isinstance(payload, list):
+            raise JiraError("Jira 状态列表响应格式不对")
+        return [
+            name
+            for name in (
+                _clean_text(item.get("name")) for item in payload if isinstance(item, dict)
+            )
+            if name
+        ]
+
+    def priorities(self) -> list[str]:
+        """Priority names, for the same reason as :meth:`statuses`."""
+
+        payload = self._request("GET", "/rest/api/2/priority")
+        if not isinstance(payload, list):
+            raise JiraError("Jira 优先级列表响应格式不对")
+        return [
+            name
+            for name in (
+                _clean_text(item.get("name")) for item in payload if isinstance(item, dict)
+            )
+            if name
+        ]
 
     def count(self, jql: str) -> int:
         """How many issues match — separates a live component from a dead one.

@@ -309,3 +309,116 @@ def test_preview_of_an_unknown_key_fails_without_writing(service, workspace, fak
         service.preview_jira_issue(workspace["id"], issue_key="CARGO-4040")
 
     assert service.list_requirements(workspace_id=workspace["id"])["total"] == 0
+
+
+# --- one fuzzy box, defaulted to the design queue ---------------------------
+#
+# The dialog used to open onto nothing: a key field with no results, plus a
+# separate search list hidden behind a toggle. Two boxes for one question
+# ("which ticket?") meant every operator had to know which one to use, and the
+# default queue — mine, waiting to be designed, P0/P1 — was never shown at all.
+
+
+def test_the_default_queue_is_the_design_backlog_not_everything_assigned(
+    service, workspace, fake_jira
+) -> None:
+    result = service.list_jira_issues(workspace["id"])
+
+    assert 'assignee = currentUser()' in result["jql"]
+    assert 'status in ("待设计")' in result["jql"]
+    assert 'priority in ("P0", "P1")' in result["jql"]
+    assert result["note"] == ""
+
+
+def test_a_mistyped_key_reads_as_no_match_instead_of_an_error(
+    service, workspace, fake_jira
+) -> None:
+    """A search box that 404s on a typo is not a search box.
+
+    The key is OR-ed with a text search rather than looked up exactly, so a
+    wrong digit returns an empty list the operator can see and correct.
+    """
+
+    result = service.list_jira_issues(workspace["id"], q="cargo-9999")
+
+    assert 'key = "CARGO-9999"' in result["jql"]
+    assert "text ~" in result["jql"]
+
+
+def test_a_keyword_search_is_a_fuzzy_text_match(service, workspace, fake_jira) -> None:
+    result = service.list_jira_issues(workspace["id"], q="报关单 批量导入")
+
+    assert 'text ~ "报关单 批量导入"' in result["jql"]
+    assert "key =" not in result["jql"]
+
+
+def test_a_pool_filter_the_site_rejects_falls_back_and_says_so(
+    service, workspace, fake_jira
+) -> None:
+    """A stored guess about status names must not open the dialog onto a 400.
+
+    "待设计" is this product's guess about someone else's Jira vocabulary. On a
+    site that calls it something else, the useful behaviour is to show the
+    tickets and state the fallback — not to hand the operator an error they
+    cannot fix from that dialog.
+    """
+
+    fake_jira.reject_jql = "待设计"
+
+    result = service.list_jira_issues(workspace["id"])
+
+    assert result["items"]
+    assert "resolution = Unresolved" in result["jql"]
+    assert "退回" in result["note"]
+    assert "does not exist for the field" in result["note"]
+
+
+def test_a_query_the_operator_typed_is_never_swapped_for_a_fallback(
+    service, workspace, fake_jira
+) -> None:
+    """Silently replacing their search would report success for a query that
+    never ran."""
+
+    fake_jira.reject_jql = "报关单"
+
+    with pytest.raises(errors.OctopError):
+        service.list_jira_issues(workspace["id"], q="报关单")
+
+
+def test_meta_reports_which_default_names_this_site_actually_has(
+    service, workspace, fake_jira
+) -> None:
+    meta = service.jira_meta(workspace["id"])
+
+    assert meta["user"] == "测试员"
+    assert meta["statuses"] == ["待设计", "开发中", "已完成"]
+    assert meta["priorities"] == ["P0", "P1", "P2"]
+    assert meta["status_hits"] == ["待设计"]
+    assert meta["priority_hits"] == ["P0", "P1"]
+    assert meta["ok"] is True
+    assert meta["error"] == ""
+
+
+def test_meta_flags_a_site_that_calls_the_status_something_else(
+    service, workspace, fake_jira
+) -> None:
+    """The whole point of the call: name the mismatch instead of failing silently."""
+
+    fake_jira.status_names = ["To Do", "In Progress", "Done"]
+
+    meta = service.jira_meta(workspace["id"])
+
+    assert meta["status_hits"] == []
+    assert meta["ok"] is False
+    assert "To Do" in meta["statuses"]
+
+
+def test_meta_tolerates_a_suffixed_workflow_name(service, workspace, fake_jira) -> None:
+    """Real statuses carry suffixes; strict equality would cry wolf."""
+
+    fake_jira.status_names = ["待设计(评审中)", "开发中"]
+
+    meta = service.jira_meta(workspace["id"])
+
+    assert meta["status_hits"] == ["待设计"]
+    assert meta["ok"] is True

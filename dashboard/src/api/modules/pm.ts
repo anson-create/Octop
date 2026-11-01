@@ -10,6 +10,7 @@ import type {
   PmIntegration,
   PmJiraIssue,
   PmJiraIssuePreview,
+  PmJiraMeta,
   PmJiraStatus,
   PmMetricRow,
   PmPaged,
@@ -87,10 +88,18 @@ export const pmApi = {
       `/pm/jira/probe${qs({ workspace_id: workspaceId })}`,
       { method: "POST" },
     ),
+  // The design queue, or whatever the operator types. One call for "which
+  // ticket?" at every level of precision: blank = my 待设计 P0/P1, a key, or a
+  // fragment of a title. `note` is set when the stored queue filter did not
+  // hold on this site and the server fell back to "my open issues".
   listJiraIssues: (workspaceId: number, q?: string, limit = 20) =>
-    request<{ jql: string; items: PmJiraIssue[]; total: number }>(
+    request<{ jql: string; items: PmJiraIssue[]; total: number; note: string }>(
       `/pm/jira/issues${qs({ workspace_id: workspaceId, q: q || undefined, limit })}`,
     ),
+  // Status and priority names as this site spells them, plus which of our
+  // defaults hit. Used to explain a mismatched queue filter in words.
+  jiraMeta: (workspaceId: number) =>
+    request<PmJiraMeta>(`/pm/jira/meta${qs({ workspace_id: workspaceId })}`),
   // One issue, read in full and assembled exactly as intake will store it. The
   // dialog calls this as soon as a key is typed, so the operator sees the
   // comments and custom fields instead of a summary line.

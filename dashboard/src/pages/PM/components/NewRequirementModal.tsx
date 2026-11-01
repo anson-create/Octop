@@ -1,11 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Alert, Button, Checkbox, Divider, Input, Modal, Spin, Tag } from "antd";
-import { FileSearch, Link2, RefreshCw, Search } from "lucide-react";
+import { Link2, RefreshCw, Search } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { pmApi } from "../../../api/modules/pm";
 import type {
   PmJiraIssue,
   PmJiraIssuePreview,
+  PmJiraMeta,
   PmJiraStatus,
   PmRequirement,
 } from "../../../api/types";
@@ -22,15 +23,16 @@ interface NewRequirementModalProps {
 /**
  * Intake is by reference, never by typing prose.
  *
- * There used to be two text boxes here (title + raw text). That made "jira" a
- * label on freehand prose: nothing checked that the text matched a real ticket,
- * and every downstream step inherited unverified input.
+ * There used to be two boxes here — a key field and, behind a toggle, a separate
+ * search list. Both asked the same question ("which ticket?") at different
+ * levels of precision, so the operator had to know which one to use, and a
+ * mistyped key produced a 404 rather than "nothing matched". There is now one
+ * fuzzy box: it opens on the design queue (mine, 待设计, P0/P1), a key matches
+ * exactly *and* as text, a phrase matches the title and description.
  *
- * The ticket *number*, though, is the fastest way in — the operator already has
- * it open in Jira. So the field at the top takes a key, reads the issue in full
- * (description, custom fields, comments, attachments) and shows exactly what
- * will be stored before anything is created. The list below is a convenience for
- * "what is assigned to me", not the only way in.
+ * Nothing is created until a ticket has been read in full and shown back. A
+ * typed key alone is never enough — that is the difference between "I typed
+ * something" and "this ticket exists and here is what we will store".
  */
 export default function NewRequirementModal({
   open,
@@ -42,18 +44,21 @@ export default function NewRequirementModal({
 
   const [status, setStatus] = useState<PmJiraStatus | null>(null);
   const [statusLoading, setStatusLoading] = useState(false);
+  const [meta, setMeta] = useState<PmJiraMeta | null>(null);
 
-  const [issueKey, setIssueKey] = useState("");
-  const [preview, setPreview] = useState<PmJiraIssuePreview | null>(null);
-  const [previewLoading, setPreviewLoading] = useState(false);
-  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [query, setQuery] = useState("");
+  const [reloadKey, setReloadKey] = useState(0);
 
-  const [showList, setShowList] = useState(false);
   const [issues, setIssues] = useState<PmJiraIssue[]>([]);
   const [listLoading, setListLoading] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
-  const [search, setSearch] = useState("");
-  const [query, setQuery] = useState("");
+  const [listNote, setListNote] = useState("");
+
+  const [selectedKey, setSelectedKey] = useState("");
+  const [preview, setPreview] = useState<PmJiraIssuePreview | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
 
   const [submitting, setSubmitting] = useState(false);
 
@@ -64,6 +69,11 @@ export default function NewRequirementModal({
   const [verifyTls, setVerifyTls] = useState(true);
   const [connecting, setConnecting] = useState(false);
   const [configError, setConfigError] = useState<string | null>(null);
+
+  // Typing fires a request per keystroke otherwise, and out-of-order replies
+  // paint the list with results for a prefix the input no longer shows.
+  const listSeq = useRef(0);
+  const previewSeq = useRef(0);
 
   // Plain functions, not useCallback: effects below key on ids only. A callback
   // that depends on `t` gets a fresh identity whenever i18next re-renders, which
@@ -85,69 +95,105 @@ export default function NewRequirementModal({
     }
   };
 
+  /**
+   * Statuses and priorities as this site spells them.
+   *
+   * The queue defaults to "待设计 / P0,P1", which is this product's guess about
+   * someone else's vocabulary. If that guess is wrong the list still loads (the
+   * server falls back), and this call supplies the names to say *why* — which is
+   * the only version of that message an operator can act on.
+   */
+  const loadMeta = async () => {
+    if (!workspaceId) return;
+    try {
+      setMeta(await pmApi.jiraMeta(workspaceId));
+    } catch {
+      // A missing catalogue must not stop intake; the fallback note still shows.
+      setMeta(null);
+    }
+  };
+
   const refreshIssues = async (needle: string) => {
     if (!workspaceId) return;
+    const seq = ++listSeq.current;
     setListLoading(true);
     setListError(null);
     try {
       const data = await pmApi.listJiraIssues(workspaceId, needle || undefined);
+      if (seq !== listSeq.current) return;
       setIssues(data.items);
+      setListNote(data.note || "");
     } catch (err) {
+      if (seq !== listSeq.current) return;
       setIssues([]);
+      setListNote("");
       setListError(apiErrorMessage(err, t("pm.newRequirement.loadFailed"), t));
     } finally {
-      setListLoading(false);
+      if (seq === listSeq.current) setListLoading(false);
     }
   };
 
   /**
-   * Read one issue and show what intake will store.
+   * Read one issue in full and show what intake will store.
    *
-   * Both entry points funnel through here — typing a key and clicking a row —
-   * so the confirm button always acts on a ticket that was actually read, never
-   * on a row that merely exists in a list.
+   * Every path — a row click, and a paste-enter on the search box — ends here,
+   * so the confirm button only ever acts on a ticket that was actually read.
    */
   const readIssue = async (raw: string) => {
     const key = raw.trim().toUpperCase();
     if (!workspaceId || !key) return;
+    const seq = ++previewSeq.current;
+    setSelectedKey(key);
     setPreviewLoading(true);
     setPreviewError(null);
     setPreview(null);
     try {
       const data = await pmApi.getJiraIssue(workspaceId, key);
+      if (seq !== previewSeq.current) return;
       setPreview(data);
-      setIssueKey(data.key);
     } catch (err) {
+      if (seq !== previewSeq.current) return;
       setPreviewError(apiErrorMessage(err, t("pm.newRequirement.readFailed"), t));
     } finally {
-      setPreviewLoading(false);
+      if (seq === previewSeq.current) setPreviewLoading(false);
     }
   };
 
   useEffect(() => {
     if (!open) return;
-    setIssueKey("");
-    setPreview(null);
-    setPreviewError(null);
-    setShowList(false);
     setSearch("");
     setQuery("");
+    setSelectedKey("");
+    setPreview(null);
+    setPreviewError(null);
     setIssues([]);
     setListError(null);
+    setListNote("");
+    setMeta(null);
     setConfigError(null);
     setToken("");
+    setReloadKey((value) => value + 1);
     void refreshStatus();
+    void loadMeta();
     // Keyed on identity, never on `t` or on the function itself.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, workspaceId]);
 
   useEffect(() => {
-    // Only when the operator opens the list. Loading it up front made the dialog
-    // look like a picker with a search box, which is the behaviour being fixed.
-    if (!open || !status?.configured || !showList) return;
+    // Debounced so a title of twenty characters is one request, not twenty.
+    if (!open || !status?.configured) return;
+    if (search.trim() === query) return;
+    const timer = window.setTimeout(() => setQuery(search.trim()), 400);
+    return () => window.clearTimeout(timer);
+  }, [search, open, status?.configured, query]);
+
+  useEffect(() => {
+    // The queue loads on open. It used to sit behind a "browse" toggle, which
+    // meant the thing the operator came for was hidden by default.
+    if (!open || !status?.configured) return;
     void refreshIssues(query);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, status?.configured, showList, query, workspaceId]);
+  }, [open, status?.configured, query, reloadKey, workspaceId]);
 
   const connect = async () => {
     if (!workspaceId) return;
@@ -163,6 +209,7 @@ export default function NewRequirementModal({
       const probe = await pmApi.probeJira(workspaceId);
       message.success(t("pm.jira.connected", { user: probe.user || probe.account || "-" }));
       await refreshStatus();
+      await loadMeta();
     } catch (err) {
       setConfigError(apiErrorMessage(err, t("pm.jira.connectFailed"), t));
     } finally {
@@ -172,7 +219,7 @@ export default function NewRequirementModal({
 
   const submit = async () => {
     if (!workspaceId || !preview) {
-      message.warning(t("pm.newRequirement.readFirst"));
+      message.warning(t("pm.newRequirement.pickFirst"));
       return;
     }
     setSubmitting(true);
@@ -199,6 +246,9 @@ export default function NewRequirementModal({
   const comments = issue?.comments ?? [];
   const attachments = issue?.attachments ?? [];
 
+  // A mismatch the operator can act on: name the site's real statuses.
+  const queueMismatch = Boolean(meta && !meta.error && !meta.ok);
+
   return (
     <Modal
       open={open}
@@ -206,9 +256,9 @@ export default function NewRequirementModal({
       onCancel={onClose}
       onOk={() => void submit()}
       okButtonProps={{ disabled: okDisabled, loading: submitting }}
-      okText={preview?.existing ? t("pm.newRequirement.openExisting") : t("pm.actions.create")}
+      okText={preview?.existing ? t("pm.newRequirement.openExisting") : t("pm.newRequirement.start")}
       cancelText={t("pm.actions.cancel")}
-      width={760}
+      width={780}
       destroyOnClose
     >
       <div style={{ marginTop: 4 }}>
@@ -246,7 +296,7 @@ export default function NewRequirementModal({
               <Input
                 value={jql}
                 onChange={(event) => setJql(event.target.value)}
-                placeholder="assignee = currentUser() AND resolution = Unresolved"
+                placeholder={meta?.jql || "assignee = currentUser() AND status in (\"待设计\")"}
               />
               <span style={{ fontSize: 11, opacity: 0.6 }}>{t("pm.jira.jqlHint")}</span>
             </label>
@@ -279,51 +329,172 @@ export default function NewRequirementModal({
           <>
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
               <Input
-                value={issueKey}
-                onChange={(event) => setIssueKey(event.target.value)}
-                onPressEnter={() => void readIssue(issueKey)}
-                placeholder={t("pm.newRequirement.keyPlaceholder")}
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                onPressEnter={() => {
+                  const needle = search.trim();
+                  if (needle === query) setReloadKey((value) => value + 1);
+                  else setQuery(needle);
+                }}
+                placeholder={t("pm.newRequirement.searchPlaceholder")}
                 allowClear
                 autoFocus
-                data-testid="pm-jira-key-input"
+                prefix={<Search size={13} />}
+                data-testid="pm-jira-search"
               />
               <Button
-                type="primary"
                 size="small"
-                icon={<FileSearch size={13} />}
-                loading={previewLoading}
-                disabled={!issueKey.trim()}
-                onClick={() => void readIssue(issueKey)}
-              >
-                {t("pm.newRequirement.read")}
-              </Button>
+                icon={<RefreshCw size={13} />}
+                loading={listLoading}
+                onClick={() => setReloadKey((value) => value + 1)}
+              />
             </div>
 
-            <div style={{ display: "flex", gap: 8, margin: "8px 0", alignItems: "center" }}>
-              {status?.base_url ? <Tag color="blue">{status.base_url}</Tag> : null}
-              <span style={{ fontSize: 11, opacity: 0.6 }}>{t("pm.jira.configured")}</span>
+            <div
+              style={{
+                display: "flex",
+                gap: 8,
+                alignItems: "center",
+                flexWrap: "wrap",
+                margin: "8px 0",
+                fontSize: 11,
+                opacity: 0.65,
+              }}
+            >
+              <span data-testid="pm-jira-queue-hint">
+                {query ? t("pm.newRequirement.searching", { q: query }) : t("pm.newRequirement.queueHint")}
+              </span>
+              {meta?.user ? <Tag color="blue" style={{ fontSize: 10 }}>{meta.user}</Tag> : null}
+              {status?.base_url ? <Tag style={{ fontSize: 10 }}>{status.base_url}</Tag> : null}
               <Button type="link" size="small" onClick={() => setShowConfig(true)}>
                 {t("pm.jira.reconfigure")}
               </Button>
             </div>
 
+            {queueMismatch ? (
+              <div data-testid="pm-jira-queue-mismatch">
+                <Alert
+                  type="warning"
+                  showIcon
+                  style={{ marginBottom: 8 }}
+                  message={t("pm.newRequirement.queueMismatch")}
+                  description={t("pm.newRequirement.queueNames", {
+                    statuses: meta?.statuses.slice(0, 8).join("、") || "-",
+                    priorities: meta?.priorities.join("、") || "-",
+                  })}
+                />
+              </div>
+            ) : null}
+
+            {listNote ? (
+              <div data-testid="pm-jira-list-note">
+                <Alert
+                  type="info"
+                  showIcon
+                  style={{ marginBottom: 8 }}
+                  message={listNote}
+                />
+              </div>
+            ) : null}
+
+            {listError ? (
+              <div data-testid="pm-jira-list-error">
+                <Alert type="error" showIcon message={listError} />
+              </div>
+            ) : null}
+
+            <div
+              data-testid="pm-jira-issues"
+              style={{
+                border: "1px solid rgba(0,0,0,0.08)",
+                borderRadius: 6,
+                maxHeight: 210,
+                overflow: "auto",
+              }}
+            >
+              {listLoading && issues.length === 0 ? (
+                <div style={{ padding: 16, textAlign: "center" }}>
+                  <Spin size="small" />
+                </div>
+              ) : null}
+              {!listLoading && issues.length === 0 && !listError ? (
+                <div
+                  data-testid="pm-jira-empty"
+                  style={{ padding: 16, textAlign: "center", opacity: 0.6, fontSize: 12 }}
+                >
+                  {t("pm.newRequirement.empty")}
+                </div>
+              ) : null}
+              {issues.map((item) => {
+                const active = item.key === selectedKey;
+                return (
+                  <button
+                    key={item.key}
+                    type="button"
+                    aria-pressed={active}
+                    data-issue-key={item.key}
+                    onClick={() => void readIssue(item.key)}
+                    style={{
+                      display: "block",
+                      width: "100%",
+                      textAlign: "left",
+                      padding: "8px 10px",
+                      border: "none",
+                      borderBottom: "1px solid rgba(0,0,0,0.06)",
+                      background: active ? "rgba(22,119,255,0.10)" : "transparent",
+                      cursor: "pointer",
+                    }}
+                  >
+                    <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                      <code style={{ fontSize: 12 }}>{item.key}</code>
+                      <span
+                        style={{
+                          fontSize: 12,
+                          fontWeight: active ? 600 : 400,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {item.title}
+                      </span>
+                      {item.priority ? (
+                        <Tag
+                          color={/^p0$/i.test(item.priority) ? "red" : undefined}
+                          style={{ marginLeft: "auto", fontSize: 10 }}
+                        >
+                          {item.priority}
+                        </Tag>
+                      ) : null}
+                      {item.status ? <Tag style={{ fontSize: 10 }}>{item.status}</Tag> : null}
+                    </div>
+                    <div style={{ fontSize: 11, opacity: 0.6, marginTop: 2 }}>
+                      {item.issue_type || "-"}
+                      {item.assignee ? ` · ${item.assignee}` : ""}
+                      {item.updated ? ` · ${item.updated.slice(0, 10)}` : ""}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+
             {previewError ? (
-              <div data-testid="pm-jira-read-error">
+              <div data-testid="pm-jira-read-error" style={{ marginTop: 10 }}>
                 <Alert type="error" showIcon message={previewError} />
               </div>
             ) : null}
 
             {previewLoading ? (
-              <div style={{ padding: 16, textAlign: "center" }}>
+              <div style={{ padding: 12, textAlign: "center" }}>
                 <Spin size="small" />
                 <div style={{ fontSize: 12, opacity: 0.6, marginTop: 6 }}>
-                  {t("pm.newRequirement.reading", { key: issueKey.trim().toUpperCase() })}
+                  {t("pm.newRequirement.reading", { key: selectedKey })}
                 </div>
               </div>
             ) : null}
 
             {preview ? (
-              <div data-testid="pm-jira-preview" style={{ display: "grid", gap: 8 }}>
+              <div data-testid="pm-jira-preview" style={{ display: "grid", gap: 8, marginTop: 10 }}>
                 {preview.existing ? (
                   <Alert
                     type="info"
@@ -415,7 +586,7 @@ export default function NewRequirementModal({
                       whiteSpace: "pre-wrap",
                       fontSize: 12,
                       lineHeight: 1.6,
-                      maxHeight: 240,
+                      maxHeight: 200,
                       overflow: "auto",
                       background: "rgba(0,0,0,0.02)",
                       border: "1px solid rgba(0,0,0,0.06)",
@@ -432,103 +603,8 @@ export default function NewRequirementModal({
                   </div>
                 </div>
               </div>
-            ) : null}
-
-            <Divider style={{ margin: "12px 0 8px" }} />
-
-            <Button
-              type="link"
-              size="small"
-              style={{ paddingLeft: 0 }}
-              onClick={() => setShowList((value) => !value)}
-            >
-              {showList ? t("pm.newRequirement.browseHide") : t("pm.newRequirement.browse")}
-            </Button>
-
-            {showList ? (
-              <>
-                <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 4 }}>
-                  <Input
-                    value={search}
-                    onChange={(event) => setSearch(event.target.value)}
-                    onPressEnter={() => setQuery(search.trim())}
-                    placeholder={t("pm.newRequirement.searchPlaceholder")}
-                    allowClear
-                    prefix={<Search size={13} />}
-                  />
-                  <Button size="small" onClick={() => setQuery(search.trim())}>
-                    {t("pm.newRequirement.search")}
-                  </Button>
-                  <Button
-                    size="small"
-                    icon={<RefreshCw size={13} />}
-                    loading={listLoading}
-                    onClick={() => void refreshIssues(query)}
-                  />
-                </div>
-
-                {listError ? <Alert type="error" showIcon message={listError} /> : null}
-
-                <div
-                  data-testid="pm-jira-issues"
-                  style={{
-                    border: "1px solid rgba(0,0,0,0.08)",
-                    borderRadius: 6,
-                    maxHeight: 240,
-                    overflow: "auto",
-                    marginTop: 8,
-                  }}
-                >
-                  {listLoading && issues.length === 0 ? (
-                    <div style={{ padding: 16, textAlign: "center" }}>
-                      <Spin size="small" />
-                    </div>
-                  ) : null}
-                  {!listLoading && issues.length === 0 && !listError ? (
-                    <div style={{ padding: 16, textAlign: "center", opacity: 0.6, fontSize: 12 }}>
-                      {t("pm.newRequirement.empty")}
-                    </div>
-                  ) : null}
-                  {issues.map((issue) => {
-                    const active = issue.key === preview?.key;
-                    return (
-                      <button
-                        key={issue.key}
-                        type="button"
-                        aria-pressed={active}
-                        data-issue-key={issue.key}
-                        onClick={() => void readIssue(issue.key)}
-                        style={{
-                          display: "block",
-                          width: "100%",
-                          textAlign: "left",
-                          padding: "8px 10px",
-                          border: "none",
-                          borderBottom: "1px solid rgba(0,0,0,0.06)",
-                          background: active ? "rgba(22,119,255,0.10)" : "transparent",
-                          cursor: "pointer",
-                        }}
-                      >
-                        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-                          <code style={{ fontSize: 12 }}>{issue.key}</code>
-                          <span style={{ fontSize: 12, fontWeight: active ? 600 : 400 }}>
-                            {issue.title}
-                          </span>
-                          {issue.status ? (
-                            <Tag style={{ marginLeft: "auto", fontSize: 10 }}>{issue.status}</Tag>
-                          ) : null}
-                        </div>
-                        <div style={{ fontSize: 11, opacity: 0.6, marginTop: 2 }}>
-                          {issue.issue_type || "-"}
-                          {issue.assignee ? ` · ${issue.assignee}` : ""}
-                          {issue.priority ? ` · ${issue.priority}` : ""}
-                          {issue.updated ? ` · ${issue.updated}` : ""}
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
-              </>
+            ) : !previewLoading && !previewError ? (
+              <Divider style={{ margin: "10px 0 0" }} />
             ) : null}
           </>
         )}

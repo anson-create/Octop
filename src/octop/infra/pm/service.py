@@ -43,6 +43,23 @@ def _looks_like_issue_key(value: str) -> bool:
     return bool(_ISSUE_KEY_RE.match(value.strip().upper()))
 
 
+def _matching_defaults(wanted: tuple[str, ...], actual: list[str]) -> list[str]:
+    """Which of our default names this site has — exactly or as a substring.
+
+    Workflow names carry suffixes ("待设计(评审中)"), so equality alone would
+    report a perfectly good site as broken and send the operator hunting for a
+    field that is already correct.
+    """
+
+    lowered = [name.lower() for name in actual]
+    hits: list[str] = []
+    for want in wanted:
+        needle = want.lower()
+        if any(needle == name or needle in name or name in needle for name in lowered):
+            hits.append(want)
+    return hits
+
+
 class PMService:
     def __init__(self, db: DatabasePool, *, audit: Any | None = None) -> None:
         self._db = db
@@ -764,6 +781,47 @@ class PMService:
             "probe_status": getattr(item, "probe_status", None) if item is not None else None,
         }
 
+    def jira_meta(self, workspace_id: int) -> dict[str, Any]:
+        """What the intake filter can legally say on this site.
+
+        The queue opens onto "待设计 / P0,P1" — two strings this product guessed
+        about a Jira site it does not own. When the guess is wrong the operator
+        gets a 400 and no way forward, so this reads back the real status and
+        priority names and reports which defaults actually exist here.
+        """
+        from octop.infra.pm.ports.base import PortError  # noqa: PLC0415
+        from octop.infra.pm.ports.jira import (  # noqa: PLC0415
+            INTAKE_PRIORITIES,
+            INTAKE_STATUSES,
+            intake_jql,
+        )
+
+        mapping = self._jira_mapping(workspace_id)
+        result: dict[str, Any] = {
+            "user": "",
+            "statuses": [],
+            "priorities": [],
+            "jql": str(mapping.get("jql") or "").strip() or intake_jql(),
+            "status_hits": [],
+            "priority_hits": [],
+            "ok": False,
+            "error": "",
+        }
+        try:
+            with self.jira_client(workspace_id) as client:
+                me = client.myself()
+                result["user"] = str(me.get("displayName") or me.get("name") or "")
+                result["statuses"] = client.statuses()
+                result["priorities"] = client.priorities()
+        except PortError as exc:
+            result["error"] = str(exc)
+            return result
+
+        result["status_hits"] = _matching_defaults(INTAKE_STATUSES, result["statuses"])
+        result["priority_hits"] = _matching_defaults(INTAKE_PRIORITIES, result["priorities"])
+        result["ok"] = bool(result["status_hits"]) and bool(result["priority_hits"])
+        return result
+
     def save_jira_config(
         self,
         workspace_id: int,
@@ -1069,29 +1127,63 @@ class PMService:
     def list_jira_issues(
         self, workspace_id: int, *, q: str | None = None, limit: int = 20
     ) -> dict[str, Any]:
-        """Candidates for the intake picker. ``q`` is a keyword or a bare issue key."""
+        """Candidates for the intake picker: one fuzzy box, not two.
+
+        Empty ``q`` means "the design queue" — mine, waiting to be designed,
+        P0/P1. That is what the operator came here to work through, so it loads
+        on open instead of hiding behind a "browse" toggle.
+
+        A key, a fragment of a title and a blank box all go through this one
+        method, because they are one question ("which ticket?") asked at
+        different levels of precision.
+        """
         from octop.infra.pm.ports.base import PortError  # noqa: PLC0415
-        from octop.infra.pm.ports.jira import DEFAULT_JQL  # noqa: PLC0415
+        from octop.infra.pm.ports.jira import DEFAULT_JQL, intake_jql  # noqa: PLC0415
 
         mapping = self._jira_mapping(workspace_id)
-        default_jql = str(mapping.get("jql") or DEFAULT_JQL)
+        configured = str(mapping.get("jql") or "").strip()
+        pool = configured or intake_jql()
+        fallback = configured or DEFAULT_JQL
         needle = (q or "").strip()
 
         if not needle:
-            jql = f"({default_jql})" if default_jql else "ORDER BY updated DESC"
+            jql = pool
         elif _looks_like_issue_key(needle):
-            jql = f'key = "{needle.upper()}"'
+            # A mistyped key has to read as "nothing matched", not as a 404 in
+            # red. This is a search field; an exact `key =` lookup is the one
+            # shape a search field can never report gracefully, so the key is
+            # OR-ed with the text search.
+            escaped = needle.replace('"', '\\"')
+            jql = f'key = "{needle.upper()}" OR text ~ "{escaped}" ORDER BY updated DESC'
         else:
-            # Quote so a title containing JQL operators cannot rewrite the query.
+            # Quoted so a title containing JQL operators cannot rewrite the query.
             escaped = needle.replace('"', '\\"')
             jql = f'text ~ "{escaped}" ORDER BY updated DESC'
 
+        note = ""
         try:
             with self.jira_client(workspace_id) as client:
-                issues = client.search(jql, limit=limit)
+                try:
+                    issues = client.search(jql, limit=limit)
+                except PortError as exc:
+                    # The pool filter is a stored guess about what this site
+                    # calls its statuses and priorities. When the guess is
+                    # wrong, Jira answers 400 and the dialog would open onto an
+                    # error nobody can fix from there — so fall back to "my open
+                    # issues" and say what happened. A search the operator typed
+                    # is never rewritten: masking their query with a fallback
+                    # would report success for something that did not run.
+                    if needle or jql == fallback:
+                        raise
+                    issues = client.search(fallback, limit=limit)
+                    jql = fallback
+                    note = (
+                        "默认筛选（状态/优先级）在本站不成立，已退回“我的未完成工单”。"
+                        f"原样报错：{exc}"
+                    )
         except PortError as exc:
             raise errors.invalid(str(exc)) from exc
-        return {"jql": jql, "items": issues, "total": len(issues)}
+        return {"jql": jql, "items": issues, "total": len(issues), "note": note}
 
     def create_requirement_from_jira(
         self,

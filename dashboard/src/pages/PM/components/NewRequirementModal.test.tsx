@@ -2,16 +2,20 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { jiraStatus, listJiraIssues, getJiraIssue, createRequirement } = vi.hoisted(() => ({
-  jiraStatus: vi.fn(),
-  listJiraIssues: vi.fn(),
-  getJiraIssue: vi.fn(),
-  createRequirement: vi.fn(),
-}));
+const { jiraStatus, jiraMeta, listJiraIssues, getJiraIssue, createRequirement } = vi.hoisted(
+  () => ({
+    jiraStatus: vi.fn(),
+    jiraMeta: vi.fn(),
+    listJiraIssues: vi.fn(),
+    getJiraIssue: vi.fn(),
+    createRequirement: vi.fn(),
+  }),
+);
 
 vi.mock("../../../api/modules/pm", () => ({
   pmApi: {
     jiraStatus,
+    jiraMeta,
     listJiraIssues,
     getJiraIssue,
     createRequirement,
@@ -24,17 +28,18 @@ vi.mock("../../../utils/antdMessage", () => ({
   message: { success: vi.fn(), error: vi.fn(), warning: vi.fn(), info: vi.fn() },
 }));
 
+import { message } from "../../../utils/antdMessage";
 import NewRequirementModal from "./NewRequirementModal";
 
 const ISSUE = {
   key: "CCTOWER-3597",
   title: "派单供应商列表新增就绪状态筛选",
   description: "按就绪状态筛选",
-  status: "In Progress",
-  status_category: "indeterminate",
+  status: "待设计",
+  status_category: "new",
   assignee: "张三",
   reporter: "李四",
-  priority: "High",
+  priority: "P0",
   issue_type: "Story",
   project: "CCTOWER",
   resolution: "",
@@ -69,6 +74,17 @@ const PREVIEW = {
   existing: null as null | { id: number; public_id: string; title: string; status: string },
 };
 
+const META = {
+  user: "测试员",
+  statuses: ["待设计", "开发中", "已完成"],
+  priorities: ["P0", "P1", "P2"],
+  jql: 'assignee = currentUser() AND status in ("待设计")',
+  status_hits: ["待设计"],
+  priority_hits: ["P0", "P1"],
+  ok: true,
+  error: "",
+};
+
 function stubStatus(configured = true) {
   jiraStatus.mockResolvedValue({
     configured,
@@ -83,10 +99,23 @@ function stubStatus(configured = true) {
 }
 
 function renderModal(
-  overrides: { configured?: boolean; preview?: typeof PREVIEW; readError?: Error } = {},
+  overrides: {
+    configured?: boolean;
+    preview?: typeof PREVIEW;
+    readError?: Error;
+    meta?: Partial<typeof META>;
+    items?: (typeof ISSUE)[];
+    note?: string;
+  } = {},
 ) {
   stubStatus(overrides.configured ?? true);
-  listJiraIssues.mockResolvedValue({ jql: "x", items: [ISSUE], total: 1 });
+  jiraMeta.mockResolvedValue({ ...META, ...overrides.meta });
+  listJiraIssues.mockResolvedValue({
+    jql: META.jql,
+    items: overrides.items ?? [ISSUE],
+    total: (overrides.items ?? [ISSUE]).length,
+    note: overrides.note ?? "",
+  });
   // Set here, not in the tests: the read only happens when the operator clicks,
   // so a mock installed after render would be too late and one installed before
   // would be overwritten by this default.
@@ -96,12 +125,7 @@ function renderModal(
     getJiraIssue.mockResolvedValue(overrides.preview ?? { ...PREVIEW });
   }
   return render(
-    <NewRequirementModal
-      open
-      workspaceId={1}
-      onClose={vi.fn()}
-      onCreated={vi.fn()}
-    />,
+    <NewRequirementModal open workspaceId={1} onClose={vi.fn()} onCreated={vi.fn()} />,
   );
 }
 
@@ -112,11 +136,13 @@ function primaryButton(): HTMLElement {
   return button as HTMLElement;
 }
 
-async function readKey(user: ReturnType<typeof userEvent.setup>, value: string) {
-  const input = await screen.findByTestId("pm-jira-key-input");
-  await user.clear(input);
-  await user.type(input, value);
-  await user.click(screen.getByRole("button", { name: "pm.newRequirement.read" }));
+async function pickRow(user: ReturnType<typeof userEvent.setup>, key = "CCTOWER-3597") {
+  const row = await waitFor(() => {
+    const found = document.querySelector(`[data-issue-key="${key}"]`);
+    if (!found) throw new Error(`row ${key} not rendered`);
+    return found as HTMLElement;
+  });
+  await user.click(row);
 }
 
 describe("NewRequirementModal", () => {
@@ -124,25 +150,56 @@ describe("NewRequirementModal", () => {
     vi.clearAllMocks();
   });
 
-  it("has no free-text intake any more", async () => {
+  it("loads the design queue on open instead of hiding it behind a toggle", async () => {
     renderModal();
-    await waitFor(() => expect(screen.getByTestId("pm-jira-key-input")).toBeInTheDocument());
 
-    // The old form had a title input and a raw-text textarea. Intake by typing
-    // prose is exactly what was removed; an issue key is a reference, not prose.
-    expect(document.querySelectorAll("textarea")).toHaveLength(0);
-    expect(screen.queryByText("pm.fields.rawText")).toBeNull();
+    // The thing the operator came here for is their own queue; making them
+    // click "browse" first turned the default into a blank dialog.
+    await waitFor(() => expect(listJiraIssues).toHaveBeenCalledWith(1, undefined));
+    expect(await screen.findByTestId("pm-jira-issues")).toBeInTheDocument();
   });
 
-  it("reads the issue behind a typed key and shows the text that will be stored", async () => {
+  it("says which queue it is showing", async () => {
+    renderModal();
+
+    const hint = await screen.findByTestId("pm-jira-queue-hint");
+    expect(hint.textContent).toBe("pm.newRequirement.queueHint");
+  });
+
+  it("has one search box, not a key field plus a separate list", async () => {
+    renderModal();
+    await screen.findByTestId("pm-jira-search");
+
+    // The old dialog had two inputs for one question, and only one of them
+    // surfaced the queue.
+    expect(document.querySelectorAll('input[type="text"]')).toHaveLength(1);
+    expect(screen.queryByTestId("pm-jira-key-input")).toBeNull();
+  });
+
+  it("searches fuzzily after a pause, not on every keystroke", async () => {
+    const user = userEvent.setup();
+    renderModal();
+    const input = await screen.findByTestId("pm-jira-search");
+
+    await user.type(input, "报关单");
+
+    // Debounced: the request carries the finished phrase, not each prefix.
+    await waitFor(() => expect(listJiraIssues).toHaveBeenCalledWith(1, "报关单"), {
+      timeout: 2000,
+    });
+    expect(listJiraIssues).not.toHaveBeenCalledWith(1, "报");
+  });
+
+  it("reads an issue in full only after one is picked", async () => {
     const user = userEvent.setup();
     renderModal();
 
-    await readKey(user, "cctower-3597");
+    // Listing proves a ticket exists; it does not prove what it says.
+    expect(getJiraIssue).not.toHaveBeenCalled();
 
-    // The key is canonicalised before it leaves the browser.
+    await pickRow(user);
+
     await waitFor(() => expect(getJiraIssue).toHaveBeenCalledWith(1, "CCTOWER-3597"));
-
     const body = await screen.findByTestId("pm-jira-preview-text");
     // Not just the description: the custom field and the comment used to be
     // dropped on the floor, and the analysis then wrote about a ticket it had
@@ -152,23 +209,25 @@ describe("NewRequirementModal", () => {
     expect(body.textContent).toContain("就绪状态要和适配器配置对齐");
   });
 
-  it("keeps OK disabled until an issue has actually been read", async () => {
-    renderModal();
-    await screen.findByTestId("pm-jira-key-input");
-
-    expect(primaryButton()).toBeDisabled();
-
-    // A key typed but not read is not a reference yet.
+  it("keeps the footer disabled until a ticket has actually been read", async () => {
     const user = userEvent.setup();
-    await user.type(screen.getByTestId("pm-jira-key-input"), "CCTOWER-3597");
+    renderModal();
+    await screen.findByTestId("pm-jira-issues");
+
     expect(primaryButton()).toBeDisabled();
+
+    await user.click(primaryButton());
+    // Clicking the disabled button does nothing, and nothing was created from a
+    // row that merely appeared in a list.
+    expect(createRequirement).not.toHaveBeenCalled();
+    expect(message.warning).not.toHaveBeenCalled();
   });
 
-  it("submits the key the server returned, not what was typed", async () => {
+  it("submits the key the server returned", async () => {
     const user = userEvent.setup();
     renderModal();
 
-    await readKey(user, "cctower-3597");
+    await pickRow(user);
     await screen.findByTestId("pm-jira-preview");
     await user.click(primaryButton());
 
@@ -177,35 +236,6 @@ describe("NewRequirementModal", () => {
       workspace_id: 1,
       issue_key: "CCTOWER-3597",
     });
-  });
-
-  it("does not load the queue until it is asked for", async () => {
-    const user = userEvent.setup();
-    renderModal();
-    await screen.findByTestId("pm-jira-key-input");
-
-    // Opening straight into a picker is the behaviour being replaced: it reads
-    // as "choose from what we found" rather than "name the ticket you mean".
-    expect(listJiraIssues).not.toHaveBeenCalled();
-    expect(screen.queryByTestId("pm-jira-issues")).toBeNull();
-
-    await user.click(screen.getByRole("button", { name: "pm.newRequirement.browse" }));
-
-    await waitFor(() => expect(listJiraIssues).toHaveBeenCalled());
-    expect(await screen.findByTestId("pm-jira-issues")).toBeInTheDocument();
-  });
-
-  it("reads an issue picked from the queue through the same path", async () => {
-    const user = userEvent.setup();
-    renderModal();
-    await screen.findByTestId("pm-jira-key-input");
-    await user.click(screen.getByRole("button", { name: "pm.newRequirement.browse" }));
-
-    const row = await screen.findByText("CCTOWER-3597");
-    await user.click(row);
-
-    await waitFor(() => expect(getJiraIssue).toHaveBeenCalledWith(1, "CCTOWER-3597"));
-    expect(await screen.findByTestId("pm-jira-preview")).toBeInTheDocument();
   });
 
   it("warns when the ticket is already a requirement instead of duplicating it", async () => {
@@ -217,10 +247,9 @@ describe("NewRequirementModal", () => {
       },
     });
 
-    await readKey(user, "CCTOWER-3597");
+    await pickRow(user);
 
     expect(await screen.findByText(/REQ-0009/)).toBeInTheDocument();
-    // The footer button no longer claims to create anything.
     expect(primaryButton().textContent).toBe("pm.newRequirement.openExisting");
   });
 
@@ -228,7 +257,7 @@ describe("NewRequirementModal", () => {
     const user = userEvent.setup();
     renderModal({ readError: new Error("Jira 返回 404：issue 不存在或地址不对") });
 
-    await readKey(user, "CCTOWER-3597");
+    await pickRow(user);
 
     expect(await screen.findByTestId("pm-jira-read-error")).toBeInTheDocument();
     expect(screen.queryByTestId("pm-jira-preview")).toBeNull();
@@ -237,24 +266,36 @@ describe("NewRequirementModal", () => {
 
   it("flags text the export blacklist will block, at intake rather than at export", async () => {
     const user = userEvent.setup();
-    renderModal({
-      preview: { ...PREVIEW, blockers: ["内部工单号 1 处（CCTOWER-1111）"] },
-    });
+    renderModal({ preview: { ...PREVIEW, blockers: ["内部工单号 1 处（CCTOWER-1111）"] } });
 
-    await readKey(user, "CCTOWER-3597");
+    await pickRow(user);
 
     expect(await screen.findByText(/CCTOWER-1111/)).toBeInTheDocument();
+  });
+
+  it("explains a queue filter the site does not recognise", async () => {
+    renderModal({
+      meta: { ok: false, status_hits: [], statuses: ["To Do", "In Progress"], error: "" },
+    });
+
+    // Naming the site's real statuses is the only version of this message an
+    // operator can act on.
+    expect(await screen.findByTestId("pm-jira-queue-mismatch")).toBeInTheDocument();
+  });
+
+  it("repeats the server's fallback note when the queue had to be widened", async () => {
+    renderModal({ note: "默认筛选（状态/优先级）在本站不成立，已退回“我的未完成工单”。" });
+
+    expect(await screen.findByTestId("pm-jira-list-note")).toBeInTheDocument();
   });
 
   it("asks for the Jira connection when none is configured", async () => {
     renderModal({ configured: false });
 
-    await waitFor(() =>
-      expect(screen.getByTestId("pm-jira-config")).toBeInTheDocument(),
-    );
-    // No key field until the site is reachable — typing into it would fail with
+    await waitFor(() => expect(screen.getByTestId("pm-jira-config")).toBeInTheDocument());
+    // No search box until the site is reachable — typing into it would fail with
     // a connection error that looks like a bad ticket number.
-    expect(screen.queryByTestId("pm-jira-key-input")).toBeNull();
-    expect(getJiraIssue).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("pm-jira-search")).toBeNull();
+    expect(listJiraIssues).not.toHaveBeenCalled();
   });
 });

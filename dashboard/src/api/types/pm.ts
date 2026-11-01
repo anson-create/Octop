@@ -357,6 +357,25 @@ export interface PmJiraStatus {
   probe_status: string | null;
 }
 
+/**
+ * What the intake queue filter may legally say on this Jira site.
+ *
+ * The queue defaults to "待设计" plus "P0"/"P1" — this product's guess about a
+ * vocabulary it does not own. `status_hits` and `priority_hits` report which of
+ * those guesses exist here, so a mismatch becomes a sentence the operator can
+ * act on instead of a 400 they cannot.
+ */
+export interface PmJiraMeta {
+  user: string;
+  statuses: string[];
+  priorities: string[];
+  jql: string;
+  status_hits: string[];
+  priority_hits: string[];
+  ok: boolean;
+  error: string;
+}
+
 /** What is waiting on a human right now — drives the sidebar badge. */
 export interface PmInbox {
   enabled: boolean;
