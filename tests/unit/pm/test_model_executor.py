@@ -514,3 +514,113 @@ def test_prd_writes_an_existing_implementation_section_from_the_source(
 
 def _prd_ctx() -> StepContext:
     return _billing_ctx("prd")
+
+
+# --- CargoWareX has no api mirror; the Vue app still answers ----------------
+
+_CWX_AIRPORT_API = '''/**
+ * 空港管理前端接口
+ */
+
+import { httpClient as http } from '@/utils/http'
+
+const API_BASE = '/mdm/airport'
+
+export const AirportApi = {
+  // 空港分页查询
+  queryPage: (params: AirportQueryRequest) => {
+    return http.post<PageResultVO<AirportVO>>(`${API_BASE}/queryPage`, params)
+  },
+}
+'''
+
+
+def _cwx_web_only_mirror(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Api mirror absent, front-end mirror present — the real CargoWareX shape."""
+
+    from octop.infra.pm.domain.repos import (
+        FRAMEWORK_JAVA,
+        FRAMEWORK_VUE3,
+        REPOS,
+        RepoSpec,
+    )
+
+    web_root = tmp_path / "cwx-web"
+    file = web_root / "src/api/basic-data/airport.ts"
+    file.parent.mkdir(parents=True, exist_ok=True)
+    file.write_text(_CWX_AIRPORT_API, encoding="utf-8")
+    monkeypatch.setitem(
+        REPOS,
+        "cwx-api",
+        RepoSpec(
+            key="cwx-api",
+            system="cargowarex",
+            layer="api",
+            framework=FRAMEWORK_JAVA,
+            mirror=str(tmp_path / "cwx-api-not-synced"),
+        ),
+    )
+    monkeypatch.setitem(
+        REPOS,
+        "cwx-web",
+        RepoSpec(
+            key="cwx-web",
+            system="cargowarex",
+            layer="web",
+            framework=FRAMEWORK_VUE3,
+            mirror=str(web_root),
+        ),
+    )
+
+
+def _cwx_ctx(step_key: str) -> StepContext:
+    return _ctx(
+        step_key,
+        source_repo={"api_repo": "cwx-api", "web_repo": "cwx-web"},
+        requirement_title="空港管理新增启用状态筛选",
+        requirement_text="空港列表需要支持按启用状态筛选，导出也要带上这个条件。",
+    )
+
+
+def test_code_probe_falls_back_to_the_frontend_when_the_api_mirror_is_missing(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cwx_web_only_mirror(tmp_path, monkeypatch)
+
+    out = _executor().run(_cwx_ctx("code"))
+
+    # A page that already calls POST /mdm/airport/queryPage is existing
+    # behaviour, even with no Java to read behind it.
+    assert out.artifact is not None and out.artifact["title"] == "代码取证"
+    spans = [item for item in out.evidence if item.get("source_type") == "code"]
+    assert spans, out.evidence
+    assert spans[0]["locator"]["repo"] == "cwx-web"
+    assert spans[0]["locator"]["path"].endswith("airport.ts")
+    assert "POST /mdm/airport/queryPage" in spans[0]["excerpt"]
+    # The skipped layer is named, so nobody reads this as "the Java was checked".
+    assert any("未核对的层" in gap and "cwx-api" in gap for gap in out.gaps), out.gaps
+    assert out.trace["source_hits"] >= 1
+
+
+def test_the_prd_gets_frontend_evidence_when_the_api_layer_is_absent(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cwx_web_only_mirror(tmp_path, monkeypatch)
+
+    factory = FakeFactory()
+    prompts: list[str] = []
+    original = factory._access.ainvoke_text
+
+    async def recording(prompt: str, **kwargs: Any) -> str:
+        prompts.append(prompt)
+        return await original(prompt, **kwargs)
+
+    factory._access.ainvoke_text = recording  # type: ignore[method-assign]
+    executor = ModelStepExecutor(models_provider=lambda: factory)
+
+    out = executor.run(_cwx_ctx("prd"))
+
+    assert "POST /mdm/airport/queryPage" in prompts[-1]
+    assert "前端源码" in prompts[-1]
+    assert any("现有实现" in item["text"] for item in out.conclusions)
+    assert any(item.get("source_type") == "code" for item in out.evidence)

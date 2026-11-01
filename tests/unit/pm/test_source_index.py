@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from octop.infra.pm.domain.repos import FRAMEWORK_JAVA, RepoSpec
-from octop.infra.pm.domain.source_index import query_terms, search_repo
+from octop.infra.pm.domain.repos import FRAMEWORK_JAVA, FRAMEWORK_VUE3, RepoSpec
+from octop.infra.pm.domain.source_index import (
+    query_terms,
+    search_repo,
+    search_requirement,
+)
 
 CONTROLLER = '''package com.walltech.cargo.controller;
 
@@ -60,9 +64,24 @@ def test_a_long_title_is_cut_into_searchable_windows() -> None:
 
     assert "就绪状态" in terms or "供应商列" in terms
     assert all(2 <= len(term) <= 6 for term in terms)
-    # Longest first: precision before domain noise.
-    lengths = [len(term) for term in terms]
-    assert lengths == sorted(lengths, reverse=True)
+    # Phrase windows and two-character terms alternate: the long window carries
+    # the meaning, the short one is often the only thing present in the source.
+    assert len(terms) >= 2
+    assert any(len(term) >= 4 for term in terms)
+    assert any(len(term) < 4 for term in terms)
+
+
+def test_the_subject_of_the_title_is_not_pushed_out_by_sentence_windows() -> None:
+    # A ticket whose body is a paragraph used to spend the whole term budget on
+    # windows like 也要带上 / 按启用状, and 空港 — the only word the source file
+    # actually contains — never reached grep.
+    terms = query_terms(
+        "空港管理新增启用状态筛选\n空港列表需要支持按启用状态筛选，导出也要带上这个条件。"
+    )
+
+    assert "空港" in terms
+    # Title terms come before body terms, not after them.
+    assert terms.index("空港") < 4
 
 
 def test_words_that_identify_nothing_are_dropped() -> None:
@@ -214,3 +233,247 @@ def test_a_constant_table_does_not_outrank_the_code_that_handles_it(tmp_path: Pa
     digest = search_repo(_spec(tmp_path), "代收垫付外币与人民币关联", limit=2)
 
     assert digest.hits[0].path.endswith("AdvanceService.java")
+
+
+# --- the front-end layer: CargoWareX has a Vue mirror but no api mirror ------
+
+AIRPORT_API = '''/**
+ * 空港管理前端接口
+ */
+
+import { httpClient as http } from '@/utils/http'
+
+const API_BASE = '/mdm/airport'
+
+export const AirportApi = {
+  // 空港分页查询
+  queryPage: (params: AirportQueryRequest) => {
+    return http.post<PageResultVO<AirportVO>>(`${API_BASE}/queryPage`, params)
+  },
+
+  // 查询空港与航线关联列表
+  queryRouteRelations: (portCode: string) => {
+    return http.post<PortRouteRelationVO[]>(`/mdm/airport/route/queryList`, { portCode })
+  },
+}
+'''
+
+ROUTES = '''import type { RouteRecordRaw } from 'vue-router'
+
+export const routes: RouteRecordRaw[] = [
+  {
+    path: '/basic-data/airport',
+    name: 'Airport',
+    component: () => import('@/views/basic-data/airport/index.vue'),
+    meta: { title: '空港管理' },
+  },
+]
+'''
+
+AIRPORT_PAGE = '''<template>
+  <div class="airport">
+    <a-button>{{ t('airport.action.add') }}</a-button>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { AirportApi } from '@/api/basic-data/airport'
+import { uploadFile } from '@/api/universal-file'
+</script>
+'''
+
+
+def _web_spec(root: Path, key: str = "cwx-web") -> RepoSpec:
+    return RepoSpec(
+        key=key,
+        system="cargowarex",
+        layer="web",
+        framework=FRAMEWORK_VUE3,
+        mirror=str(root),
+    )
+
+
+def test_a_frontend_api_module_yields_endpoint_plus_method(tmp_path: Path) -> None:
+    _write(tmp_path, "src/api/basic-data/airport.ts", AIRPORT_API)
+
+    digest = search_repo(_web_spec(tmp_path), "空港")
+
+    assert digest.ok
+    assert digest.layer == "web"
+    hit = digest.hits[0]
+    assert hit.kind == "endpoint"
+    # `${API_BASE}/queryPage` is not a path anyone can look up; the resolved one is.
+    assert "POST /mdm/airport/queryPage" in hit.excerpt
+    assert "queryPage" in hit.excerpt
+    # The comment is the human label, and it travels with the path.
+    assert "空港分页查询" in hit.excerpt
+
+
+def test_a_router_file_says_which_view_a_path_mounts(tmp_path: Path) -> None:
+    _write(tmp_path, "src/router/routes.ts", ROUTES)
+
+    digest = search_repo(_web_spec(tmp_path), "空港管理")
+
+    assert digest.ok
+    hit = digest.hits[0]
+    assert hit.kind == "route"
+    assert "路由 /basic-data/airport" in hit.excerpt
+    assert "views/basic-data/airport/index.vue" in hit.excerpt
+
+
+def test_a_page_is_reached_through_its_route_and_names_its_api_modules(
+    tmp_path: Path,
+) -> None:
+    # Page labels live in i18n, so the page file itself contains none of the
+    # ticket's words and grep never reaches it. The route does.
+    _write(tmp_path, "src/router/routes.ts", ROUTES)
+    _write(tmp_path, "src/views/basic-data/airport/index.vue", AIRPORT_PAGE)
+
+    digest = search_repo(_web_spec(tmp_path), "空港管理")
+
+    pages = [hit for hit in digest.hits if hit.kind == "page"]
+    assert pages, digest.hits
+    assert pages[0].path.endswith("views/basic-data/airport/index.vue")
+    assert pages[0].excerpt.startswith("airport:")
+    assert "@/api/basic-data/airport" in pages[0].excerpt
+
+
+def test_the_frontend_build_output_is_never_quoted(tmp_path: Path) -> None:
+    # `dist/` and `node_modules/` repeat the same vocabulary thousands of times
+    # and none of it is source anyone edited.
+    _write(tmp_path, "dist/assets/index-abc.js", "空港 空港 空港")
+    _write(tmp_path, "node_modules/some-lib/readme.ts", "空港")
+    _write(tmp_path, "src/api/basic-data/airport.ts", AIRPORT_API)
+
+    digest = search_repo(_web_spec(tmp_path), "空港")
+
+    assert digest.ok
+    assert all("dist/" not in hit.path and "node_modules/" not in hit.path for hit in digest.hits)
+
+
+def test_the_api_layer_is_read_before_the_front_end(tmp_path: Path) -> None:
+    api_root = tmp_path / "cw-api"
+    web_root = tmp_path / "cwx-web"
+    _write(api_root, "act-service/src/main/java/com/walltech/cargo/controller/AirportController.java", CONTROLLER.replace("ChargeConfirmed", "Airport").replace("/chargeConfirmed", "/airport"))
+    _write(web_root, "src/api/basic-data/airport.ts", AIRPORT_API)
+
+    digest = search_requirement(
+        [_spec(api_root), _web_spec(web_root)], "供应商费用确认"
+    )
+
+    assert digest is not None
+    assert digest.layer == "api"
+    # Nothing was skipped, because the first layer answered.
+    assert digest.skipped == ()
+
+
+def test_a_missing_api_mirror_falls_back_to_the_front_end_and_says_so(
+    tmp_path: Path,
+) -> None:
+    web_root = tmp_path / "cwx-web"
+    _write(web_root, "src/api/basic-data/airport.ts", AIRPORT_API)
+
+    digest = search_requirement(
+        [
+            RepoSpec(
+                key="cwx-api",
+                system="cargowarex",
+                layer="api",
+                framework=FRAMEWORK_JAVA,
+                mirror=str(tmp_path / "never-synced"),
+            ),
+            _web_spec(web_root),
+        ],
+        "空港",
+    )
+
+    assert digest is not None
+    assert digest.ok and digest.layer == "web"
+    # "read the front end instead" must not read as "read everything".
+    assert any("cwx-api" in note and "镜像未同步" in note for note in digest.skipped)
+    assert "未检索" in digest.render()
+
+
+def test_when_every_layer_fails_the_reason_names_them_all(tmp_path: Path) -> None:
+    digest = search_requirement(
+        [
+            RepoSpec(
+                key="cwx-api",
+                system="cargowarex",
+                layer="api",
+                framework=FRAMEWORK_JAVA,
+                mirror=str(tmp_path / "no-api"),
+            ),
+            RepoSpec(
+                key="cwx-web",
+                system="cargowarex",
+                layer="web",
+                framework=FRAMEWORK_VUE3,
+                mirror=str(tmp_path / "no-web"),
+            ),
+        ],
+        "空港",
+    )
+
+    assert digest is not None and not digest.ok
+    assert "cwx-api" in digest.reason and "cwx-web" in digest.reason
+
+
+def test_a_page_matching_only_a_generic_word_is_not_evidence(tmp_path: Path) -> None:
+    # "表单" appears in half the repository; "询价表单" appears in one place.
+    _write(
+        tmp_path,
+        "src/views/app-management/app-access/index.vue",
+        "<template><div><!-- 配置表单 --></div></template>\n",
+    )
+    _write(
+        tmp_path,
+        "src/views/inquiry/form/index.vue",
+        "<template><div><!-- 询价表单字段配置 --></div></template>\n",
+    )
+
+    digest = search_repo(_web_spec(tmp_path), "询价表单字段问题")
+
+    paths = [hit.path for hit in digest.hits]
+    assert any("inquiry/form" in path for path in paths), paths
+    assert all("app-management" not in path for path in paths), paths
+
+
+def test_a_router_is_silent_when_no_route_is_about_the_ticket(tmp_path: Path) -> None:
+    # The router mentions 供应商 in a comment, but no route mounts such a page.
+    # Quoting its first four routes would look like evidence and be noise.
+    _write(
+        tmp_path,
+        "src/router/routes.ts",
+        "// 供应商改造尚未接入路由\n"
+        "export const routes = [\n"
+        "  { path: '/auth/admin', component: () => import('@/views/auth/admin-login.vue') },\n"
+        "  { path: '/dashboard', component: () => import('@/views/dashboard/index.vue') },\n"
+        "]\n",
+    )
+
+    digest = search_repo(_web_spec(tmp_path), "供应商")
+
+    assert not digest.ok
+    assert "没有可读的结构" in digest.reason
+
+
+def test_the_endpoint_quoted_is_the_one_whose_comment_matches(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/api/price.ts",
+        "const API_BASE = '/price'\n"
+        "export const PriceApi = {\n"
+        "  // 分页查询整箱运价\n"
+        "  page: (p) => http.post(`${API_BASE}/fcl/page`, p),\n"
+        "  // 供应商询价单保存\n"
+        "  saveInquiry: (p) => http.post(`${API_BASE}/inquiry/save`, p),\n"
+        "}\n",
+    )
+
+    digest = search_repo(_web_spec(tmp_path), "供应商询价单保存")
+
+    assert digest.ok
+    excerpt = digest.hits[0].excerpt
+    assert "/price/inquiry/save" in excerpt
+    assert "/price/fcl/page" not in excerpt

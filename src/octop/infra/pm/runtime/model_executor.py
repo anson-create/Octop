@@ -26,8 +26,11 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-from octop.infra.pm.domain.repos import REPOS
-from octop.infra.pm.domain.source_index import SourceDigest, search_repo
+from octop.infra.pm.domain.repos import REPOS, RepoSpec
+from octop.infra.pm.domain.source_index import (
+    SourceDigest,
+    search_requirement,
+)
 from octop.infra.pm.runtime.executor import (
     ExecutorUnavailable,
     StepContext,
@@ -346,18 +349,27 @@ class ModelStepExecutor:
         )
 
     def _source_lookup(self, ctx: StepContext) -> SourceDigest | None:
-        """What the product already does, from the api layer's own source.
+        """What the product already does, from its own source.
 
-        ``None`` means this requirement is not mapped to an api repository at
-        all — a different fact from "mapped, but nothing matched", which comes
-        back as a digest carrying the reason. The two produce different gaps.
+        ``None`` means this requirement is not mapped to a repository at all —
+        a different fact from "mapped, but nothing matched", which comes back as
+        a digest carrying the reason. The two produce different gaps.
+
+        The api layer is tried first and the web layer only if it comes back
+        empty. CargoWareX's api tree is not mirrored on the host; its Vue app
+        is, and "this page already calls POST /mdm/airport/queryList" is still
+        evidence about existing behaviour.
         """
 
         source = dict(ctx.source_repo or {})
-        spec = REPOS.get(str(source.get("api_repo") or ""))
-        if spec is None:
-            return None
-        return search_repo(spec, f"{ctx.requirement_title}\n{ctx.requirement_text}")
+        specs: list[RepoSpec] = []
+        for field in ("api_repo", "web_repo"):
+            spec = REPOS.get(str(source.get(field) or ""))
+            if spec is not None and spec not in specs:
+                specs.append(spec)
+        return search_requirement(
+            specs, f"{ctx.requirement_title}\n{ctx.requirement_text}"
+        )
 
     def _source_evidence(
         self, digest: SourceDigest | None, *, limit: int = 4
@@ -529,8 +541,12 @@ class ModelStepExecutor:
             points = [item for item in payload.get("touchpoints") or [] if isinstance(item, dict)]
             gaps = [str(item) for item in payload.get("gaps") or [] if str(item).strip()]
             gaps.insert(0, "代码面结论来自源码静态检索（未运行验证），需研发复核")
+            # A layer that was skipped is not a detail: the front end proves the
+            # page calls an endpoint, not what the endpoint does.
+            if digest.skipped:
+                gaps.insert(1, f"未核对的层：{'；'.join(digest.skipped)}")
             note = (
-                f"按 {digest.repo} 源码检索到 {len(digest.hits)} 处既有实现取证"
+                f"按 {digest.repo}（{digest.layer_label}）检索到 {len(digest.hits)} 处既有实现取证"
                 f"（候选 {digest.candidates} 个文件），未运行验证。"
             )
             sources = ["requirement", "code"]
@@ -1401,7 +1417,8 @@ class ModelStepExecutor:
             f"现网已有的实现（源码静态检索得出，是「现有实现」小节的依据）：\n{facts}\n\n" if facts else ""
         )
         citation = (
-            "引用既有接口时必须照抄上面的路径，不要改写路径，也不要新造库里没有的接口名。"
+            "引用既有实现时必须照抄上面的接口路径或页面路径，不要改写，"
+            "也不要新造库里没有的接口名。"
             if facts
             else ""
         )
