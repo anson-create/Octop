@@ -320,6 +320,30 @@ export interface PmJiraIssue {
   labels: string[];
   created: string;
   updated: string;
+  /** Present only on the single-issue read, which asks Jira for the full set. */
+  components?: string[];
+  environment?: string;
+  custom_fields?: { id: string; name: string; text: string }[];
+  comments?: { author: string; text: string; created: string }[];
+  attachments?: { filename: string; mime: string; size: string }[];
+}
+
+/**
+ * What the intake dialog shows after a key is typed.
+ *
+ * `requirement_text` is assembled by the same server-side function that fills
+ * the requirement row, so the preview cannot promise something the write path
+ * will not store.
+ */
+export interface PmJiraIssuePreview {
+  key: string;
+  issue: PmJiraIssue;
+  requirement_text: string;
+  sections: string[];
+  truncated: string[];
+  /** Content a deliverable may not carry verbatim (internal ticket ids, paths). */
+  blockers: string[];
+  existing: { id: number; public_id: string; title: string; status: string } | null;
 }
 
 export interface PmJiraStatus {

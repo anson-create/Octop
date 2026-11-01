@@ -110,6 +110,22 @@ async def jira_issues(
     return pm.list_jira_issues(workspace_id, q=q, limit=limit)
 
 
+@router.get("/jira/issue/{issue_key}", summary="Read one issue in full, before importing")
+async def jira_issue(
+    issue_key: str,
+    workspace_id: int,
+    pm: PMService = Depends(get_pm),
+    _: Any = Depends(require_permission("pm")),
+) -> dict[str, Any]:
+    """Everything the ticket says, assembled the way intake will store it.
+
+    The dialog accepts a typed key and calls this before creating anything, so
+    the operator sees the comments and custom fields that used to be dropped
+    silently. ``existing`` is non-null when the ticket is already a requirement.
+    """
+    return pm.preview_jira_issue(workspace_id, issue_key=issue_key)
+
+
 @router.get("/jira/projects", summary="Jira projects and which repo each routes to")
 async def jira_projects(
     workspace_id: int,

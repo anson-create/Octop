@@ -1133,25 +1133,23 @@ class PMService:
             raise errors.invalid(str(exc)) from exc
 
         title = (issue.get("title") or key).strip()
-        description = (issue.get("description") or "").strip()
-        if not description:
-            # G-P1-03 accepts an explicit statement of absence, but an empty raw
-            # text makes every downstream step hallucinate around nothing. Say so
-            # in the text instead of leaving it blank.
-            description = f"（Jira 工单未填写描述；以下事实仅来自标题）{title}"
 
-        # The issue key deliberately stays out of raw_text. Every export runs a
-        # blacklist scan that blocks internal ticket ids, and the intake artifact
-        # embeds this text verbatim — so a key here would make the requirement
-        # permanently un-exportable. The key lives in source_ref and baseline,
-        # which are metadata and never rendered into the deliverable.
-        raw_text = description
-
-        # Snapshot of everything the ticket says about *where* this lives. Kept
-        # out of raw_text on purpose: comments are conversation, not requirement
-        # text, and mixing them in would change what every downstream document
-        # claims the customer asked for.
+        # Everything the ticket states becomes the requirement text — description,
+        # the custom fields the team fills in, environment, components, and the
+        # comments. Keeping only the description was the earlier behaviour and it
+        # was wrong for this product: the refinement usually lives in the
+        # comments, and the model writing the analysis never saw it.
+        #
+        # The issue key still stays out: every export runs a blacklist that
+        # blocks ticket ids and the intake artifact embeds this text verbatim, so
+        # a key in here makes the requirement permanently un-exportable. Comments
+        # may mention *other* tickets, which is reported rather than rewritten —
+        # silently editing what a customer wrote is worse than a blocked export.
+        from octop.infra.pm.domain.jira_intake import compose  # noqa: PLC0415
         from octop.infra.pm.domain.locate_evidence import LocateEvidence  # noqa: PLC0415
+
+        composed = compose(issue)
+        raw_text = composed.text or f"（Jira 工单未填写任何内容；以下事实仅来自标题）{title}"
 
         evidence = LocateEvidence.from_issue(issue)
 
@@ -1180,11 +1178,75 @@ class PMService:
                     {"name": item.get("name"), "text": str(item.get("text") or "")[:400]}
                     for item in (issue.get("custom_fields") or [])
                 ],
+                # The full ticket now lives in raw_text, so these record how it
+                # was assembled rather than repeating the content: which sections
+                # made it, what had to be cut, and what a deliverable may not
+                # carry. Without them a truncated text looks like a short ticket.
+                "jira_comment_count": len(issue.get("comments") or []),
+                "jira_attachments": [
+                    {
+                        "filename": item.get("filename"),
+                        "mime": item.get("mime"),
+                        "size": item.get("size"),
+                    }
+                    for item in (issue.get("attachments") or [])
+                ],
+                "jira_text_sections": list(composed.sections),
+                "jira_text_truncated": list(composed.truncated),
+                "jira_export_blockers": list(composed.blockers),
                 "locate_evidence": evidence.as_dict(),
             },
             client_token=client_token,
             actor=actor,
         )
+
+    def preview_jira_issue(self, workspace_id: int, *, issue_key: str) -> dict[str, Any]:
+        """Read one issue in full, without creating anything.
+
+        The intake dialog needs to show what will be stored before it is stored —
+        including the parts a summary would hide: the comments, the custom fields,
+        and whether this ticket was already imported. It runs the same
+        ``compose`` the write path runs, so the preview cannot drift from the
+        result.
+        """
+
+        from octop.infra.pm.domain.jira_intake import compose  # noqa: PLC0415
+        from octop.infra.pm.ports.base import PortError  # noqa: PLC0415
+
+        key = (issue_key or "").strip().upper()
+        if not key:
+            raise errors.invalid("issue_key is required")
+        if not _looks_like_issue_key(key):
+            raise errors.invalid(f"「{issue_key}」不像是 Jira 工单号，应形如 CCTOWER-3597")
+
+        try:
+            with self.jira_client(workspace_id) as client:
+                issue = client.issue(key, with_context=True)
+        except PortError as exc:
+            raise errors.invalid(str(exc)) from exc
+
+        composed = compose(issue)
+        existing = self._repos.requirements.get_by_source_ref(workspace_id, "jira", key)
+        return {
+            "key": key,
+            "issue": issue,
+            "requirement_text": composed.text,
+            "sections": list(composed.sections),
+            "truncated": list(composed.truncated),
+            "blockers": list(composed.blockers),
+            # Present means the OK button should open the existing requirement
+            # instead of creating a second one, which the API would return anyway.
+            "existing": (
+                None
+                if existing is None
+                else {
+                    "id": existing.id,
+                    "public_id": existing.public_id,
+                    "title": existing.title,
+                    "status": existing.status,
+                }
+            ),
+        }
 
     # --- integrations ------------------------------------------------------
 

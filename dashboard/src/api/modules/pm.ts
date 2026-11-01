@@ -9,6 +9,7 @@ import type {
   PmInbox,
   PmIntegration,
   PmJiraIssue,
+  PmJiraIssuePreview,
   PmJiraStatus,
   PmMetricRow,
   PmPaged,
@@ -89,6 +90,13 @@ export const pmApi = {
   listJiraIssues: (workspaceId: number, q?: string, limit = 20) =>
     request<{ jql: string; items: PmJiraIssue[]; total: number }>(
       `/pm/jira/issues${qs({ workspace_id: workspaceId, q: q || undefined, limit })}`,
+    ),
+  // One issue, read in full and assembled exactly as intake will store it. The
+  // dialog calls this as soon as a key is typed, so the operator sees the
+  // comments and custom fields instead of a summary line.
+  getJiraIssue: (workspaceId: number, issueKey: string) =>
+    request<PmJiraIssuePreview>(
+      `/pm/jira/issue/${encodeURIComponent(issueKey)}${qs({ workspace_id: workspaceId })}`,
     ),
 
   // --- workspaces ---------------------------------------------------------
