@@ -283,3 +283,160 @@ public interface BillingFeignClient {
 
     assert feign is not None and feign.feign is True
     assert plain is not None and plain.feign is False
+
+
+# ---------------------------------------------------------------------------
+# MyBatis-Plus：表名在实体注解上，SQL 由框架生成，仓库里没有一行可读
+# ---------------------------------------------------------------------------
+
+ENTITY = """package com.demo.order.entity;
+
+import com.baomidou.mybatisplus.annotation.TableName;
+
+@TableName("t_order")
+public class Order {
+
+    private Long id;
+    private String orderNo;
+}
+"""
+
+ORDER_MAPPER = """package com.demo.order.mapper;
+
+import com.baomidou.mybatisplus.core.mapper.BaseMapper;
+
+public interface OrderMapper extends BaseMapper<Order> {
+}
+"""
+
+ORDER_ISERVICE = """package com.demo.order.service;
+
+import com.baomidou.mybatisplus.extension.service.IService;
+
+public interface IOrderService extends IService<Order> {
+}
+"""
+
+ORDER_SERVICE_IMPL = """package com.demo.order.service.impl;
+
+import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+
+@Service
+public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements IOrderService {
+
+    public List<Order> listRecent(int hours) {
+        return baseMapper.selectList(null);
+    }
+}
+"""
+
+ORDER_CONTROLLER = """package com.demo.order.controller;
+
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/order")
+public class OrderController {
+
+    private final IOrderService orderService;
+
+    @GetMapping("detail")
+    public Result<Order> detail(@RequestParam Long id) {
+        return Result.ok(orderService.getOne(id));
+    }
+}
+"""
+
+
+def _mybatis_plus_repo(tmp_path: Path) -> Path:
+    root = tmp_path / "mp-api"
+    base = "order-service/src/main/java/com/demo/order"
+    _write(root, f"{base}/entity/Order.java", ENTITY)
+    _write(root, f"{base}/mapper/OrderMapper.java", ORDER_MAPPER)
+    _write(root, f"{base}/service/IOrderService.java", ORDER_ISERVICE)
+    _write(root, f"{base}/service/impl/OrderServiceImpl.java", ORDER_SERVICE_IMPL)
+    _write(root, f"{base}/controller/OrderController.java", ORDER_CONTROLLER)
+    return root
+
+
+def test_a_table_name_written_only_on_the_entity_is_still_found(tmp_path: Path) -> None:
+    """MyBatis-Plus 的链路里没有 SQL：表名只在 @TableName，绑定只在泛型。"""
+
+    root = _mybatis_plus_repo(tmp_path)
+    out = tmp_path / "graph.sqlite"
+    store(walk_roots([str(root)]), str(out))
+
+    conn = sqlite3.connect(out)
+    result = trace(conn, "GET /order/detail")
+
+    assert result["found"] is True
+    assert result["tables"] == ["t_order"]
+    # 这条链路一张 SQL 都没有，必须写清楚表是「泛型绑定」推出来的
+    assert result["statements"] == []
+    assert "IOrderService(service-interface)" in result["owners"]
+
+
+def test_the_base_mapper_a_service_impl_never_declares_is_followed(tmp_path: Path) -> None:
+    """ServiceImpl 子类不声明 baseMapper（在父类里），字段注入抓不到。"""
+
+    root = _mybatis_plus_repo(tmp_path)
+    controller = """package com.demo.order.controller;
+
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/order")
+public class RecentController {
+
+    private final OrderServiceImpl orderService;
+
+    @GetMapping("recent")
+    public List<Order> recent() {
+        return orderService.listRecent(24);
+    }
+}
+"""
+    _write(
+        root,
+        "order-service/src/main/java/com/demo/order/controller/RecentController.java",
+        controller,
+    )
+    out = tmp_path / "graph.sqlite"
+    store(walk_roots([str(root)]), str(out))
+
+    conn = sqlite3.connect(out)
+    result = trace(conn, "GET /order/recent")
+
+    assert result["tables"] == ["t_order"]
+    # 依据是 Mapper 那层：Service 的实现类自己绑的表反而没被走到
+    assert "OrderMapper(mapper)" in result["owners"]
+
+
+def test_a_class_bound_to_an_entity_without_a_table_name_claims_nothing() -> None:
+    """实体没有 @TableName 时不许拿类名去当表名猜。"""
+
+    text = ENTITY.replace('@TableName("t_order")\n', "")
+    cls = parse_java(text, "Order.java")
+
+    assert cls is not None
+    assert cls.table_name == ""
+
+
+def test_an_upsert_tail_is_not_mistaken_for_a_table_name() -> None:
+    """`ON DUPLICATE KEY UPDATE id = id` 里的 update 后面是列名，不是表。"""
+
+    namespace, statements = parse_mapper(
+        """<?xml version="1.0"?>
+<mapper namespace="com.demo.rate.RateShareStoreMapper">
+  <insert id="ensureRelations">
+    INSERT INTO prc_rate_share_relation (id, source_rate_id, tenant_id)
+    VALUES (#{row.id}, #{row.sourceRateId}, #{row.tenantId})
+    ON DUPLICATE KEY UPDATE id = id
+  </insert>
+</mapper>
+""",
+        "RateShareStoreMapper.xml",
+    )
+
+    assert namespace == "com.demo.rate.RateShareStoreMapper"
+    assert statements[0][2] == ["prc_rate_share_relation"]

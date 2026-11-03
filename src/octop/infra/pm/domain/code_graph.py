@@ -129,6 +129,36 @@ _MAPPING = {
 }
 _HTTP_HINT = re.compile(r"RequestMethod\.(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)")
 
+# extends 的泛型实参。``_CLASS_DECL`` 只抓 extends 的名字，泛型那段是非捕获的——
+# 而 MyBatis-Plus 把「这条链路最后落到哪张表」整个藏在泛型里：
+# ``XxxMapper extends BaseMapper<TenantUser>``、
+# ``XxxServiceImpl extends ServiceImpl<XxxMapper, TenantUser>``、
+# ``IXxxService extends IService<TenantUser>``。抓不到这段，表名就永远找不到，
+# 因为这类代码在仓库里没有一行 SQL。
+_EXTENDS_GEN = re.compile(r"\bextends\s+([\w.]+)\s*<\s*([^{;]{0,200}?)\s*>", re.S)
+
+
+def _split_args(text: str) -> list[str]:
+    """泛型实参按顶层逗号切开。``Map<String, List<Order>>`` 算两个而不是三个。"""
+
+    parts: list[str] = []
+    depth = 0
+    current = ""
+    for char in text:
+        if char == "<":
+            depth += 1
+        elif char == ">":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(current)
+            current = ""
+            continue
+        current += char
+    if current.strip():
+        parts.append(current)
+    return [part.strip().split("<")[0].split(".")[-1] for part in parts if part.strip()]
+
+
 _SQL_TABLE = re.compile(
     r"\b(?:from|join|update|insert\s+into|into)\s+"
     r"([A-Za-z_][\w$]*\.[A-Za-z_][\w$]*|[A-Za-z_][\w$]*)",
@@ -140,6 +170,14 @@ _SQL_SKIP = {
     "if", "foreach", "trim", "choose", "when", "otherwise", "each", "bind",
     "include", "sql", "where_clause", "set_clause",
 }
+
+# ``ON DUPLICATE KEY UPDATE id = id`` 是 MySQL 的 upsert 收尾语。``update`` 后面
+# 跟的是列名不是表名，直接抽会得到一张叫 id 的表。
+_ON_DUPLICATE = re.compile(r"\bon\s+duplicate\s+key\s+update\b", re.I)
+
+
+def _drop_upsert(text: str) -> str:
+    return _ON_DUPLICATE.sub(" ", text)
 
 # 内联 SQL：JdbcTemplate、@Select 注解、以及手拼的 Statement。这类代码不走
 # Mapper XML，只从 XML 抽表名会把它们整个漏掉——备份模块 4 个 Service 全是
@@ -181,7 +219,7 @@ def inline_sql_tables(segment: str) -> list[tuple[str, list[str]]]:
         else:
             kind = "sql"
         tables: list[str] = []
-        for table in _SQL_TABLE.finditer(sql):
+        for table in _SQL_TABLE.finditer(_drop_upsert(sql)):
             name = table.group(1).split(".")[-1]
             if name.lower() in _SQL_SKIP or len(name) < 2:
                 continue
@@ -223,6 +261,13 @@ class JavaClass:
     # 顺着它永远走不到 Mapper——把它当端点会让「接口能不能追到表」的分母凭空
     # 多出四分之一，而这些端点注定追不到。
     feign: bool = False
+    # 实体上的 @TableName("t_xxx")。MyBatis-Plus 的表名只写在这里，SQL 是框架
+    # 生成的，代码里没有任何 from 子句可抽。
+    table_name: str = ""
+    # 泛型里绑定的实体短名：BaseMapper<E> / IService<E> / ServiceImpl<M, E>。
+    base_entity: str = ""
+    # extends 的名字（不带泛型），用来判断这层绑定是 Mapper 还是 Service。
+    extends_base: str = ""
     fields: dict[str, str] = field(default_factory=dict)
     methods: list[Method] = field(default_factory=list)
 
@@ -249,6 +294,38 @@ def _ann_path(raw: str, start: int, end: int) -> str:
     return found.group(1) if found else ""
 
 
+def _bind_generic_entity(cls: JavaClass, raw: str, decl: str) -> None:
+    """从 extends 的泛型里把实体绑到类上。
+
+    MyBatis-Plus 的三层绑定都只写在泛型里：Mapper 绑实体、ServiceImpl 绑
+    Mapper 和实体、IService 绑实体。实体自己带 @TableName。这三跳拼起来才是
+    「这条链路落到哪张表」——少了任何一跳，这类代码在图谱上就是死路，因为
+    仓库里根本没有它的 SQL。
+
+    ServiceImpl 子类不声明 ``baseMapper`` 字段（在父类里），所以字段注入抓不到
+    它。这里把它补成一个隐式字段，方法体里的 ``baseMapper.selectList(...)`` 才
+    接得上 Mapper。
+    """
+
+    bound = _EXTENDS_GEN.search(decl)
+    if bound is None:
+        return
+    cls.extends_base = bound.group(1).split(".")[-1]
+    args = _split_args(bound.group(2))
+    if not args:
+        return
+
+    if cls.extends_base.endswith("BaseMapper"):
+        cls.base_entity = args[0]
+    elif cls.extends_base.endswith("ServiceImpl"):
+        # ServiceImpl<Mapper, Entity>：实体在最后一位，自定义的中间父类同理。
+        cls.base_entity = args[-1]
+        if len(args) >= 2:
+            cls.fields.setdefault("baseMapper", args[0])
+    elif cls.extends_base.endswith("IService"):
+        cls.base_entity = args[-1]
+
+
 def parse_java(raw: str, rel: str) -> JavaClass | None:
     masked = mask(raw)
     decl = _CLASS_DECL.search(masked)
@@ -273,15 +350,20 @@ def parse_java(raw: str, rel: str) -> JavaClass | None:
     # 类级注解：从文件开头到类声明之间的所有注解
     head = masked[: decl.start()]
     for ann in _ANN.finditer(head):
-        cls.annotations.append(ann.group(1).split(".")[-1])
-        if ann.group(1).split(".")[-1] in _MAPPING:
+        simple_ann = ann.group(1).split(".")[-1]
+        cls.annotations.append(simple_ann)
+        if simple_ann in _MAPPING:
             cls.base_path = _ann_path(raw, ann.start(), ann.end())
+        elif simple_ann == "TableName":
+            # 带库名前缀的写法（"erp.t_order"）只留表名，追溯时按表名对齐。
+            cls.table_name = _ann_path(raw, ann.start(), ann.end()).split(".")[-1]
     cls.controller = any(
         name in {"RestController", "Controller"} for name in cls.annotations
     )
     # 只认注解，不认类名。叫 XxxFeign 但没有 @FeignClient 的接口确实存在，
     # 按名字猜会把一个真实 Controller 踢出分母，那种错没法从数字上看出来。
     cls.feign = any(name == "FeignClient" for name in cls.annotations)
+    _bind_generic_entity(cls, raw, decl.group(0))
 
     body_start = decl.end() - 1  # 指向 '{'
     body_end = _braces(masked, body_start)
@@ -452,7 +534,7 @@ def parse_mapper(raw: str, rel: str) -> tuple[str, list[tuple[str, str, list[str
         stmt_id = stmt.group(2)
         body = stmt.group(3)
         tables: list[str] = []
-        for table in _SQL_TABLE.finditer(body):
+        for table in _SQL_TABLE.finditer(_drop_upsert(body)):
             name = table.group(1)
             short = name.split(".")[-1]
             if short.lower() in _SQL_SKIP or not short:
@@ -475,6 +557,9 @@ class Graph:
     classes: dict[str, JavaClass] = field(default_factory=dict)
     impls: dict[str, list[str]] = field(default_factory=dict)
     mappers: dict[str, list[tuple[str, str, list[str]]]] = field(default_factory=dict)
+    # 类短名 -> (表名, 依据)。依据是 mapper / service-impl / service-interface，
+    # 三种都是「泛型绑实体 + 实体带 @TableName」推出来的，强度不一样，所以要留痕。
+    owner_tables: dict[str, tuple[str, str]] = field(default_factory=dict)
 
     def add(self, cls: JavaClass) -> None:
         self.classes[cls.fqn] = cls
@@ -488,6 +573,33 @@ class Graph:
             bucket = self.mappers.setdefault(cls.name, [])
             for kind, tables in method.sql_tables:
                 bucket.append((method.name, kind, tables))
+
+    def resolve_tables(self) -> None:
+        """把「泛型绑实体」+「实体带 @TableName」拼成类到表的映射。
+
+        必须在全仓解析完之后做：Mapper 和实体常常在两个模块里，先读到的那个
+        不知道对方长什么样。
+        """
+
+        entity_table = {
+            cls.name: cls.table_name
+            for cls in self.classes.values()
+            if cls.table_name
+        }
+        for cls in self.classes.values():
+            if not cls.base_entity:
+                continue
+            table = entity_table.get(cls.base_entity)
+            if not table:
+                continue
+            base = cls.extends_base
+            if base.endswith("BaseMapper"):
+                via = "mapper"
+            elif base.endswith("ServiceImpl"):
+                via = "service-impl"
+            else:
+                via = "service-interface"
+            self.owner_tables[cls.name] = (table, via)
 
 
 def walk_roots(roots: list[str], limit: int = 0) -> Graph:
@@ -544,6 +656,7 @@ def walk_roots(roots: list[str], limit: int = 0) -> Graph:
         file=sys.stderr,
         flush=True,
     )
+    graph.resolve_tables()
     return graph
 
 
@@ -560,6 +673,9 @@ CREATE TABLE IF NOT EXISTS edge (
 );
 CREATE TABLE IF NOT EXISTS tbl (
   statement TEXT, table_name TEXT, kind TEXT
+);
+CREATE TABLE IF NOT EXISTS tbl_owner (
+  cls TEXT PRIMARY KEY, table_name TEXT, via TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ix_edge ON edge(src, dst, kind);
 CREATE INDEX IF NOT EXISTS ix_edge_dst ON edge(dst);
@@ -582,19 +698,36 @@ def build_edges(
 
     @FeignClient 的映射只建边、不建端点：它是调用方的声明，真正的实现在别的
     服务里，顺着它走不到任何表。
+
+    节点 id 必须是全限定名：字段注入只给得出短名（``private final XxxService
+    xxxService``），而边上记录的源节点是全名，两者不一致时第二跳就查不到——
+    实测 29,506 个被调节点没有一个自己还有出边，整张图只有一跳深。短名能唯一
+    对应到一个类时换成全名，不能唯一时保留短名：宁可这一条链断，也不要把两个
+    同名类的调用混在一起。
     """
+
+    by_short: dict[str, list[str]] = {}
+    for known in graph.classes.values():
+        by_short.setdefault(known.name, []).append(known.fqn)
+
+    def resolve(short: str) -> str:
+        found = by_short.get(short)
+        if found is not None and len(found) == 1:
+            return found[0]
+        return short
 
     edges: list[tuple[str, str, str]] = []
     endpoints: list[tuple[str, str, str, str]] = []
     for cls in graph.classes.values():
         if cls.extends:
-            edges.append((f"cls:{cls.fqn}", f"cls:{cls.extends}", "extends"))
+            edges.append((f"cls:{cls.fqn}", f"cls:{resolve(cls.extends)}", "extends"))
         for interface in cls.implements:
-            edges.append((f"cls:{cls.fqn}", f"cls:{interface}", "implements"))
+            edges.append((f"cls:{cls.fqn}", f"cls:{resolve(interface)}", "implements"))
         for method in cls.methods:
             src = _method_node(cls.fqn, method.name)
             for target in method.calls:
-                edges.append((src, f"m:{target}", "call"))
+                owner, _, name = target.partition("#")
+                edges.append((src, _method_node(resolve(owner), name), "call"))
             if method.http and not cls.feign:
                 ep = f"{method.http} {method.path}"
                 endpoints.append((ep, cls.fqn, method.name, cls.rel))
@@ -620,11 +753,16 @@ def store(graph: Graph, out: str) -> dict[str, int]:
             for table in tables:
                 rows.append((f"{mapper}.{stmt_id}", table, kind))
     conn.executemany("INSERT INTO tbl(statement,table_name,kind) VALUES(?,?,?)", rows)
+    conn.executemany(
+        "INSERT OR REPLACE INTO tbl_owner(cls,table_name,via) VALUES(?,?,?)",
+        [(name, table, via) for name, (table, via) in graph.owner_tables.items()],
+    )
     conn.commit()
 
     counts = {
         "classes": len(graph.classes),
         "mappers": len(graph.mappers),
+        "owner_tables": len(graph.owner_tables),
         "endpoints": len(endpoints),
         "edges": len(edges),
         "table_refs": len(rows),
@@ -639,6 +777,11 @@ def trace(conn: sqlite3.Connection, endpoint: str, max_depth: int = 8) -> dict[s
     一跳一个可核对的事实：字段注入说明它调谁，implements 说明接口的实现在哪，
     XML 的 namespace.id 说明这条 SQL 碰哪张表。任何一跳缺失只会让表少几张，
     不会凭空给出一张不存在的表——宁可少说，不能说错。
+
+    MyBatis-Plus 的链路没有 SQL 可读，靠的是另一条事实链：类名落到
+    ``tbl_owner``（由泛型 + @TableName 推出），走过这个类的任何方法都算碰到
+    它的表。依据记在 ``via`` 里，能看出这张表是 Mapper 绑来的还是 Service
+    绑来的。
     """
 
     row = conn.execute(
@@ -652,6 +795,7 @@ def trace(conn: sqlite3.Connection, endpoint: str, max_depth: int = 8) -> dict[s
     queue: list[tuple[str, int]] = [(_method_node(cls, method), 0)]
     tables: set[str] = set()
     statements: set[str] = set()
+    owners: set[str] = set()
     walked: list[str] = []
     while queue:
         node, depth = queue.pop(0)
@@ -659,6 +803,15 @@ def trace(conn: sqlite3.Connection, endpoint: str, max_depth: int = 8) -> dict[s
             continue
         seen.add(node)
         walked.append(node)
+        # 走到某个类的方法上，就看这个类是不是绑了表。起点也查，因为接口本身
+        # 可能就是 Mapper 暴露出来的。
+        owner = node[2:].partition("#")[0].split(".")[-1]
+        owned = conn.execute(
+            "SELECT table_name, via FROM tbl_owner WHERE cls = ?", (owner,)
+        ).fetchone()
+        if owned is not None:
+            tables.add(owned[0])
+            owners.add(f"{owner}({owned[1]})")
         for (dst,) in conn.execute(
             "SELECT dst FROM edge WHERE src = ? AND kind = 'call'", (node,)
         ):
@@ -684,6 +837,7 @@ def trace(conn: sqlite3.Connection, endpoint: str, max_depth: int = 8) -> dict[s
         "rel": rel,
         "nodes": len(seen),
         "statements": sorted(statements),
+        "owners": sorted(owners),
         "tables": sorted(tables),
     }
 
@@ -721,6 +875,11 @@ def main() -> int:
             return 1
         print(f"{cls.kind} {cls.fqn}  controller={cls.controller}  base={cls.base_path}")
         print(f"  implements={cls.implements}  字段={len(cls.fields)}  方法={len(cls.methods)}")
+        if cls.table_name or cls.base_entity:
+            print(
+                f"  表={cls.table_name or '（无）'}  绑实体={cls.base_entity or '（无）'}"
+                f"  extends={cls.extends_base or '（无）'}"
+            )
         for name, type_name in list(cls.fields.items())[:8]:
             print(f"    字段 {type_name} {name}")
         for method in cls.methods:
@@ -761,6 +920,7 @@ def main() -> int:
             continue
         print(f"  文件 {result['rel']}  走过 {result['nodes']} 个节点")
         print(f"  statement {result['statements'] or '（无）'}")
+        print(f"  类绑定的表 {result['owners'] or '（无）'}")
         print(f"  表 {result['tables'] or '（无）'}")
     return 0
 
