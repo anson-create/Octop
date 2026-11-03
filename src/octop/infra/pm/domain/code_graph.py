@@ -218,6 +218,11 @@ class JavaClass:
     annotations: list[str] = field(default_factory=list)
     base_path: str = ""
     controller: bool = False
+    # @FeignClient 是**调用方**的声明，不是被调方的端点。它长得和 Controller
+    # 一模一样（类上 @RequestMapping、方法上 @PostMapping），但没有方法体，
+    # 顺着它永远走不到 Mapper——把它当端点会让「接口能不能追到表」的分母凭空
+    # 多出四分之一，而这些端点注定追不到。
+    feign: bool = False
     fields: dict[str, str] = field(default_factory=dict)
     methods: list[Method] = field(default_factory=list)
 
@@ -274,6 +279,9 @@ def parse_java(raw: str, rel: str) -> JavaClass | None:
     cls.controller = any(
         name in {"RestController", "Controller"} for name in cls.annotations
     )
+    # 只认注解，不认类名。叫 XxxFeign 但没有 @FeignClient 的接口确实存在，
+    # 按名字猜会把一个真实 Controller 踢出分母，那种错没法从数字上看出来。
+    cls.feign = any(name == "FeignClient" for name in cls.annotations)
 
     body_start = decl.end() - 1  # 指向 '{'
     body_end = _braces(masked, body_start)
@@ -571,6 +579,9 @@ def build_edges(
     方法节点不带参数个数：在「这个接口会碰到哪张表」这个问题上重载应当合并，
     少写一个 argc 换来的是不会因为 ``save(String)`` 和 ``save(String, int)``
     分别建点而丢掉一半的表。
+
+    @FeignClient 的映射只建边、不建端点：它是调用方的声明，真正的实现在别的
+    服务里，顺着它走不到任何表。
     """
 
     edges: list[tuple[str, str, str]] = []
@@ -584,7 +595,7 @@ def build_edges(
             src = _method_node(cls.fqn, method.name)
             for target in method.calls:
                 edges.append((src, f"m:{target}", "call"))
-            if method.http:
+            if method.http and not cls.feign:
                 ep = f"{method.http} {method.path}"
                 endpoints.append((ep, cls.fqn, method.name, cls.rel))
                 edges.append((f"ep:{ep}", src, "handles"))
@@ -719,13 +730,10 @@ def main() -> int:
                     print(f"          -> {call}")
         return 0
 
-    if args.query_only or args.coverage:
-        if not os.path.exists(args.out):
-            print(f"图谱不存在：{args.out}")
-            return 1
-    else:
-        if not args.root:
-            parser.error("--root 至少给一个")
+    # --coverage 只说明「建完顺便报个体检结果」，不该因此跳过建图。只有明确
+    # 说 --query-only、或者根本没给 --root 时才读旧库。
+    rebuild = bool(args.root) and not args.query_only
+    if rebuild:
         started = time.time()
         graph = walk_roots(args.root, limit=args.limit)
         counts = store(graph, args.out)
@@ -733,6 +741,9 @@ def main() -> int:
         print(f"\n图谱：{args.out}  ({size:.1f} MB, {time.time() - started:.0f}s)")
         for key, value in counts.items():
             print(f"  {key:12} {value}")
+    elif not os.path.exists(args.out):
+        print(f"图谱不存在：{args.out}")
+        return 1
 
     conn = sqlite3.connect(args.out)
     if args.coverage:

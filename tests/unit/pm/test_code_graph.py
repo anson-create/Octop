@@ -226,3 +226,60 @@ def test_two_classes_with_the_same_simple_name_both_survive(tmp_path: Path) -> N
     graph = walk_roots([str(root)])
 
     assert len(graph.classes) == 2
+
+
+FEIGN_CLIENT = """package com.demo.billing.client;
+
+import org.springframework.cloud.openfeign.FeignClient;
+import org.springframework.web.bind.annotation.*;
+
+@FeignClient(name = "control-tower-service", path = "/inner/billing")
+public interface BillingFeignClient {
+
+    @PostMapping("list")
+    Result<PageInfo<BillPaymentVO>> list(@RequestBody BillQuery query);
+}
+"""
+
+
+def test_a_feign_client_is_how_we_call_out_not_an_endpoint_we_serve(tmp_path: Path) -> None:
+    """@FeignClient 长得和 Controller 一样，但没有方法体，顺着它走不到 Mapper。
+
+    把它当端点会让分母凭空多出四分之一（本机 5236 条里有 1210 条），而这些
+    端点注定追不到表，覆盖率因此被平白压低。
+    """
+
+    root = _billing_repo(tmp_path)
+    _write(
+        root,
+        "billing-service/src/main/java/com/demo/billing/client/BillingFeignClient.java",
+        FEIGN_CLIENT,
+    )
+    out = tmp_path / "graph.sqlite"
+    store(walk_roots([str(root)]), str(out))
+
+    conn = sqlite3.connect(out)
+    owners = {row[0] for row in conn.execute("SELECT cls FROM endpoint")}
+    assert "com.demo.billing.client.BillingFeignClient" not in owners
+    assert "com.demo.billing.controller.BillingController" in owners
+
+
+def test_an_interface_is_excluded_by_its_annotation_not_by_its_name() -> None:
+    """只认 @FeignClient。按名字猜会踢掉真 Controller，而且数字上看不出来。"""
+
+    named_like_a_client = """package com.demo.billing.api;
+
+import org.springframework.web.bind.annotation.*;
+
+public interface BillingFeignClient {
+
+    @PostMapping("list")
+    Result<?> list();
+}
+"""
+
+    feign = parse_java(FEIGN_CLIENT, "BillingFeignClient.java")
+    plain = parse_java(named_like_a_client, "BillingFeignClient.java")
+
+    assert feign is not None and feign.feign is True
+    assert plain is not None and plain.feign is False
