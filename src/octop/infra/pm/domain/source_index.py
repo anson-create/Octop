@@ -492,6 +492,34 @@ def _entry_tokens(entry: _I18nEntry) -> dict[str, float]:
     return weights
 
 
+def _dictionary_terms(
+    roots: Sequence[Path], title: str, *, limit: int = 6
+) -> tuple[str, ...]:
+    """English identifiers from every front end's label dictionary.
+
+    Union rather than first-wins: CargoWareX's tenant app and its back office are
+    two apps in one monorepo with two vocabularies, and a ticket written against
+    either one has to reach the Java. The cap is shared, so two big dictionaries
+    cannot flood the query with English words that only widen recall.
+    """
+
+    merged: list[str] = []
+    for root in roots:
+        for term in _i18n_terms(root, title):
+            if term in merged:
+                continue
+            merged.append(term)
+            if len(merged) >= limit:
+                return tuple(merged)
+    return tuple(merged)
+
+
+def _top_score(digest: SourceDigest) -> int:
+    """The best hit's score, for comparing two layers' answers."""
+
+    return max((hit.score for hit in digest.hits), default=0)
+
+
 def _i18n_terms(root: Path | None, title: str, *, limit: int = 6) -> tuple[str, ...]:
     """English identifiers for a Chinese title, taken from the product's labels.
 
@@ -1206,30 +1234,32 @@ def search_requirement(
     limit: int = 6,
     timeout_s: float = 20.0,
 ) -> SourceDigest | None:
-    """First layer that has something to say, in the order given.
+    """The layer that has something to say: api first, then the best front end.
 
     ``None`` means the requirement is mapped to no repository at all, which is a
     different fact from "mapped, but every layer came back empty" — the caller
     words its gap differently, so the two must not be flattened here.
 
     The api layer goes first because a mapping path is more precise than a page
-    name. When its mirror is absent the front end still answers "which page and
-    which endpoint", and the digest carries the skipped layer so a reader knows
-    the Java behind it was never read.
+    name. What follows is no longer one front end: CargoWareX is a single
+    monorepo holding the tenant product (``control-tower``) and the back office
+    (``platform-admin``), and a ticket belongs to one of them. Both are read and
+    the stronger answer wins. Taking the first that answered *anything* would
+    hand every ticket to whichever app was listed first — a big app always
+    matches 表单 or 状态 somewhere, so the other one would never be consulted.
     """
 
     if not specs:
         return None
+    web_specs = [spec for spec in specs if spec.layer == "web"]
     # The front end is where the Chinese labels live, so it is the dictionary
     # for the api layer even when the api layer is the one being searched.
-    dictionary = next(
-        (spec.root() for spec in specs if spec.layer == "web" and spec.root().is_dir()),
-        None,
+    extra = _dictionary_terms(
+        [spec.root() for spec in web_specs if spec.root().is_dir()], query
     )
-    extra = _i18n_terms(dictionary, query)
     notes: list[str] = []
     first: SourceDigest | None = None
-    for spec in specs:
+    for spec in [item for item in specs if item.layer != "web"]:
         digest = search_repo(
             spec, query, limit=limit, timeout_s=timeout_s, extra_terms=extra
         )
@@ -1238,6 +1268,32 @@ def search_requirement(
         notes.append(f"{spec.key}：{digest.reason}")
         if first is None:
             first = digest
+
+    best: SourceDigest | None = None
+    for spec in web_specs:
+        digest = search_repo(
+            spec, query, limit=limit, timeout_s=timeout_s, extra_terms=extra
+        )
+        if not digest.ok:
+            notes.append(f"{spec.key}：{digest.reason}")
+            if first is None:
+                first = digest
+            continue
+        if best is None:
+            best = digest
+            continue
+        challenger, incumbent = _top_score(digest), _top_score(best)
+        if challenger > incumbent:
+            notes.append(
+                f"{best.repo}：也检索过，最高命中分 {incumbent}，低于 {spec.key} 的 {challenger}"
+            )
+            best = digest
+        else:
+            notes.append(
+                f"{spec.key}：也检索过，最高命中分 {challenger}，低于 {best.repo} 的 {incumbent}"
+            )
+    if best is not None:
+        return replace(best, skipped=tuple(notes))
     if first is None:  # pragma: no cover - specs was non-empty
         return None
     # Every layer failed: the reason has to mention all of them, or the reader

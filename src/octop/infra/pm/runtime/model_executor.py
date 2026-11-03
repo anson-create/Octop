@@ -355,16 +355,19 @@ class ModelStepExecutor:
         a different fact from "mapped, but nothing matched", which comes back as
         a digest carrying the reason. The two produce different gaps.
 
-        The api layer is tried first and the web layer only if it comes back
-        empty. The front end is also the label dictionary: a Chinese ticket
-        reaches an English controller through the product's own zh-CN/en-US
-        pairs, so an empty api answer means the code was searched, not that the
-        words were untranslatable.
+        The api layer is tried first, then the customer-facing app, then the
+        back office. CargoWareX is one monorepo with the tenant product and the
+        operator console in it, and both are read: a ticket about 询价 belongs to
+        the header app, a ticket about 应用开通 to the console, and which one it
+        is cannot be decided by the order of a list. The front ends are also the
+        label dictionary — a Chinese ticket reaches an English controller through
+        the product's own zh-CN/en-US pairs, so an empty api answer means the
+        code was searched, not that the words were untranslatable.
         """
 
         source = dict(ctx.source_repo or {})
         specs: list[RepoSpec] = []
-        for field in ("api_repo", "web_repo"):
+        for field in ("api_repo", "app_repo", "web_repo"):
             spec = REPOS.get(str(source.get(field) or ""))
             if spec is not None and spec not in specs:
                 specs.append(spec)

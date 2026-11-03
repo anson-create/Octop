@@ -115,7 +115,21 @@ def test_saved_mapping_can_route_a_project_the_seed_table_never_knew() -> None:
     binding = resolve_project("OPS", {"OPS": "cargowarex"})
 
     assert binding is not None
-    assert binding.repos == ("cwx-web", "cwx-api")
+    # A system means every layer of it: the api, the back office, and the tenant
+    # app (a second front end from the same monorepo).
+    assert binding.repos == ("cwx-web", "cwx-api", "cwx-h5")
+
+
+def test_the_prototype_source_and_the_evidence_source_are_not_the_same_app() -> None:
+    """``web`` is where the prototype is derived from; ``app`` is where the
+    ticket's page actually is. Reading the second one must not move the first."""
+
+    binding = resolve_project("CCTOWER")
+
+    assert binding is not None
+    assert binding.web is not None and binding.web.key == "cwx-web"
+    assert binding.app is not None and binding.app.key == "cwx-h5"
+    assert binding.api is not None and binding.api.key == "cwx-api"
 
 
 def test_mapping_straddling_both_products_is_rejected() -> None:

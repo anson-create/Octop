@@ -11,6 +11,11 @@ Two systems, two layers each:
     cargoware    web  Vue 2.6 + Element UI 2.15      api  Java (Maven, 18 modules)
     cargowarex   web  Vue 3.4 + Arco 2.57 + Tailwind api  Java (Maven)
 
+CargoWareX's front end is one monorepo with two apps in it — the tenant product
+(``control-tower``) and the operator back office (``platform-admin``) — so that
+system has two web mirrors. Evidence reads both; the prototype is still derived
+from the one declared first, which keeps existing derivations where they were.
+
 The mapping runs **Jira project key -> repository**, never a keyword search over
 every checkout. A keyword search would sooner or later read the wrong product's
 source and then produce a confident, structurally faithful, completely wrong
@@ -138,6 +143,15 @@ class RepoSpec:
     # different audiences. Empty means the repo has one app and no preference is
     # needed; it never overrides a genuinely ambiguous match inside that app.
     preferred_app: str = ""
+    # Which end of the product this mirror is, when a system has more than one
+    # front end. ``admin`` is the operator back office, ``app`` is the product
+    # the customer uses. Empty for single-ended repos and for api layers.
+    #
+    # This is not decoration: the prototype is derived from ``web`` (the first
+    # web spec) while evidence reads every front end, and those two are not
+    # always the same app — a tenant ticket's page lives in the app, but the
+    # prototype has to keep coming from the tree it always came from.
+    role: str = ""
 
     @property
     def is_web(self) -> bool:
@@ -178,6 +192,7 @@ REPOS: dict[str, RepoSpec] = {
         ui_lib="arco",
         mirror=f"{_DEFAULT_MIRROR_ROOT}/cwx-platform-admin",
         preferred_app="control-tower",
+        role="admin",
     ),
     "cwx-api": RepoSpec(
         key="cwx-api",
@@ -185,6 +200,21 @@ REPOS: dict[str, RepoSpec] = {
         layer="api",
         framework=FRAMEWORK_JAVA,
         mirror=f"{_DEFAULT_MIRROR_ROOT}/cwx-api",
+    ),
+    # The tenant product, from the same monorepo (cargo-controller-tower-h5)
+    # as cwx-web: control-tower is where a CCTOWER ticket's page actually is —
+    # 订单、订舱、计费、询价 all live here, while platform-admin only carries
+    # the operator screens. It is a separate mirror rather than a subdirectory
+    # because both the router index and the i18n catalogue are anchored at
+    # ``<root>/src``; pointing at the monorepo root would find neither.
+    "cwx-h5": RepoSpec(
+        key="cwx-h5",
+        system="cargowarex",
+        layer="web",
+        framework=FRAMEWORK_VUE3,
+        ui_lib="arco",
+        mirror=f"{_DEFAULT_MIRROR_ROOT}/cwx-h5",
+        role="app",
     ),
     "cw-web": RepoSpec(
         key="cw-web",
@@ -238,6 +268,20 @@ class ProjectBinding:
     @property
     def api(self) -> RepoSpec | None:
         return self.spec("api")
+
+    @property
+    def app(self) -> RepoSpec | None:
+        """The front end the customer uses, when the system has more than one.
+
+        Read for evidence, never for rendering: a ticket's page is usually here
+        while the prototype keeps coming from ``web``.
+        """
+
+        for key in self.repos:
+            spec = REPOS.get(key)
+            if spec is not None and spec.role == "app":
+                return spec
+        return None
 
     def describe(self) -> str:
         shown = "、".join(self.repos) if self.repos else "未映射"

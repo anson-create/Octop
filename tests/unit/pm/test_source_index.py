@@ -638,3 +638,137 @@ def test_a_matched_label_still_reads_when_the_english_twin_is_missing(tmp_path: 
     assert digest is not None
     assert digest.ok
     assert "Airport" in digest.terms
+
+
+# --- one product, two front ends --------------------------------------------
+#
+# CargoWareX is a single monorepo: the tenant product (control-tower) and the
+# operator console (platform-admin) are two apps, not two versions of one. A
+# ticket belongs to exactly one of them, and "the first app that matched
+# something" is not a way to find out which.
+
+INQUIRY_API = '''/**
+ * 供应商询价表单前端接口
+ */
+
+import { httpClient as http } from '@/utils/http'
+
+const API_BASE = '/bidding/inquiry'
+
+export const InquiryApi = {
+  // 询价表单分页
+  page: (params: InquiryQuery) => {
+    return http.post<PageResultVO<InquiryVO>>(`${API_BASE}/page`, params)
+  },
+}
+'''
+
+
+def test_the_page_is_found_in_the_app_even_when_the_console_is_listed_first(
+    tmp_path: Path,
+) -> None:
+    app = tmp_path / "control-tower"
+    admin = tmp_path / "platform-admin"
+    _write(app, "src/api/basic-data/airport.ts", AIRPORT_API)
+    _write(admin, "src/api/bidding/inquiry.ts", INQUIRY_API)
+
+    digest = search_requirement(
+        [_web_spec(admin, "cwx-web"), _web_spec(app, "cwx-h5")], "空港管理"
+    )
+
+    assert digest is not None
+    assert digest.ok
+    assert digest.repo == "cwx-h5"
+    assert digest.hits[0].path == "src/api/basic-data/airport.ts"
+    # The console was read and did not have it; saying so is the difference
+    # between "searched" and "ignored".
+    assert any("cwx-web" in note for note in digest.skipped)
+
+
+def test_a_console_ticket_still_reaches_the_console(tmp_path: Path) -> None:
+    app = tmp_path / "control-tower"
+    admin = tmp_path / "platform-admin"
+    _write(app, "src/api/basic-data/airport.ts", AIRPORT_API)
+    _write(admin, "src/api/bidding/inquiry.ts", INQUIRY_API)
+
+    digest = search_requirement(
+        [_web_spec(app, "cwx-h5"), _web_spec(admin, "cwx-web")], "供应商询价表单"
+    )
+
+    assert digest is not None
+    assert digest.ok
+    assert digest.repo == "cwx-web"
+
+
+def test_equal_evidence_keeps_the_order_and_names_the_loser(tmp_path: Path) -> None:
+    app = tmp_path / "control-tower"
+    admin = tmp_path / "platform-admin"
+    _write(app, "src/api/basic-data/airport.ts", AIRPORT_API)
+    _write(admin, "src/api/basic-data/airport.ts", AIRPORT_API)
+
+    digest = search_requirement(
+        [_web_spec(app, "cwx-h5"), _web_spec(admin, "cwx-web")], "空港管理"
+    )
+
+    assert digest is not None
+    assert digest.repo == "cwx-h5"
+    assert any("低于" in note for note in digest.skipped)
+
+
+def test_the_label_dictionary_is_the_union_of_both_front_ends(tmp_path: Path) -> None:
+    """空港 is a label in the tenant app, 询价 in the console. A ticket that uses
+    both words must reach a controller named after either one."""
+
+    api_root = tmp_path / "cwx-api"
+    app = tmp_path / "control-tower"
+    admin = tmp_path / "platform-admin"
+    _write(
+        api_root,
+        "bidding-service/src/main/java/com/walltech/tower/bidding/controller/InquiryController.java",
+        """package com.walltech.tower.bidding.controller;
+
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/bidding/inquiry")
+public class InquiryController {
+
+    @PostMapping("page")
+    public Result<PageInfo<InquiryVO>> page(@RequestBody InquiryQuery request) {
+        return Result.ok(null);
+    }
+}
+""",
+    )
+    _write(
+        app,
+        "src/i18n/modules/zh-CN/port.ts",
+        "export default {\n  tabs: {\n    airport: '空港'\n  }\n}\n",
+    )
+    _write(
+        app,
+        "src/i18n/modules/en-US/port.ts",
+        "export default {\n  tabs: {\n    airport: 'Airports'\n  }\n}\n",
+    )
+    _write(
+        admin,
+        "src/i18n/modules/zh-CN/bidding.ts",
+        "export default {\n  inquiry: {\n    title: '询价'\n  }\n}\n",
+    )
+    _write(
+        admin,
+        "src/i18n/modules/en-US/bidding.ts",
+        "export default {\n  inquiry: {\n    title: 'Inquiry'\n  }\n}\n",
+    )
+
+    digest = search_requirement(
+        [_spec(api_root, "cwx-api"), _web_spec(app, "cwx-h5"), _web_spec(admin, "cwx-web")],
+        "空港与询价管理",
+    )
+
+    assert digest is not None
+    assert digest.ok
+    assert digest.layer == "api"
+    assert "InquiryController" in digest.hits[0].path

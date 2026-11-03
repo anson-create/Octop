@@ -338,6 +338,7 @@ class Pipeline:
             }
         web = binding.web
         api = binding.api
+        app = binding.app
         return {
             "project": project,
             "mapped": True,
@@ -353,6 +354,12 @@ class Pipeline:
             "api_repo": api.key if api is not None else "",
             "api_mirror": api.mirror if api is not None else "",
             "api_mirror_ready": bool(api is not None and api.root().is_dir()),
+            # The customer-facing app, when the system has a second front end.
+            # Evidence reads it before the back office: a tenant ticket is about
+            # a page the customer opens, and that page is not in platform-admin.
+            "app_repo": app.key if app is not None else "",
+            "app_mirror": app.mirror if app is not None else "",
+            "app_mirror_ready": bool(app is not None and app.root().is_dir()),
         }
 
     def _locate_evidence(self, requirement: Any) -> Any:
