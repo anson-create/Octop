@@ -1,0 +1,228 @@
+"""代码链路图谱的回归用例。
+
+这里的每个用例都对应一次真实代码打脸：路径少了类级前缀、注释里的花括号
+把类边界算错、JdbcTemplate 的内联 SQL 整个漏掉。构造的 Java 片段刻意长得
+和仓库里的写法一样（Lombok final 注入、@RequestBody 泛型参数）。
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+from octop.infra.pm.domain.code_graph import (
+    inline_sql_tables,
+    parse_java,
+    parse_mapper,
+    store,
+    trace,
+    walk_roots,
+)
+
+
+def _write(root: Path, rel: str, text: str) -> Path:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+BILLING_CONTROLLER = """package com.demo.billing.controller;
+
+import org.springframework.web.bind.annotation.*;
+import lombok.RequiredArgsConstructor;
+
+@RestController
+@RequestMapping("/billing")
+@RequiredArgsConstructor
+public class BillingController {
+
+    private final BillPaymentService billPaymentService;
+
+    /**
+     * 付款列表。文档里的 {@code {id}} 不是代码。
+     */
+    @PostMapping("list")
+    public Result<PageInfo<BillPaymentVO>> list(@RequestBody BillQuery query) {
+        return billPaymentService.queryPage(query);
+    }
+}
+"""
+
+BILLING_SERVICE = """package com.demo.billing.service;
+
+public interface BillPaymentService {
+
+    PageInfo<BillPaymentVO> queryPage(BillQuery query);
+}
+"""
+
+BILLING_IMPL = """package com.demo.billing.service.impl;
+
+import com.demo.billing.mapper.BillPaymentMapper;
+
+@Service
+public class BillPaymentServiceImpl implements BillPaymentService {
+
+    private final BillPaymentMapper billPaymentMapper;
+
+    @Override
+    public PageInfo<BillPaymentVO> queryPage(BillQuery query) {
+        int total = billPaymentMapper.countByQuery(query);
+        return PageInfo.of(billPaymentMapper.selectPage(query), total);
+    }
+}
+"""
+
+BILLING_MAPPER = """package com.demo.billing.mapper;
+
+@Mapper
+public interface BillPaymentMapper {
+
+    int countByQuery(BillQuery query);
+
+    List<BillPaymentVO> selectPage(BillQuery query);
+}
+"""
+
+BILLING_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.demo.billing.mapper.BillPaymentMapper">
+
+  <select id="countByQuery" resultType="int">
+    SELECT COUNT(1) FROM t_bill_payment WHERE status != 9
+  </select>
+
+  <select id="selectPage" resultType="BillPaymentVO">
+    SELECT p.* FROM t_bill_payment p
+    LEFT JOIN dim_tenant t ON t.id = p.tenant_id
+    WHERE p.status != 9
+  </select>
+</mapper>
+"""
+
+
+def _billing_repo(tmp_path: Path) -> Path:
+    root = tmp_path / "cwx-api"
+    base = "billing-service/src/main/java/com/demo/billing"
+    _write(root, f"{base}/controller/BillingController.java", BILLING_CONTROLLER)
+    _write(root, f"{base}/service/BillPaymentService.java", BILLING_SERVICE)
+    _write(root, f"{base}/service/impl/BillPaymentServiceImpl.java", BILLING_IMPL)
+    _write(root, f"{base}/mapper/BillPaymentMapper.java", BILLING_MAPPER)
+    _write(
+        root,
+        "billing-service/src/main/resources/mapper/BillPaymentMapper.xml",
+        BILLING_XML,
+    )
+    return root
+
+
+def test_a_class_level_prefix_is_part_of_the_path() -> None:
+    """`POST list` 是废路径：真实地址是 /billing/list。"""
+
+    cls = parse_java(BILLING_CONTROLLER, "BillingController.java")
+
+    assert cls is not None
+    assert cls.controller
+    assert cls.base_path == "/billing"
+    mapped = [method for method in cls.methods if method.http]
+    assert [(method.http, method.path) for method in mapped] == [("POST", "/billing/list")]
+
+
+def test_a_lombok_final_field_is_how_the_controller_reaches_the_service() -> None:
+    """@RequiredArgsConstructor 没有 @Autowired，字段照样是注入点。"""
+
+    cls = parse_java(BILLING_CONTROLLER, "BillingController.java")
+
+    assert cls is not None
+    assert cls.fields == {"billPaymentService": "BillPaymentService"}
+    assert cls.methods[0].calls == ["BillPaymentService#queryPage"]
+
+
+def test_braces_inside_comments_and_strings_do_not_move_the_class_boundary() -> None:
+    source = """package com.demo;
+
+public class Trap {
+
+    /* 这个方法用来 } 骗人 */
+    private String tpl = "{not code}";
+
+    // 还有 { 这里
+    public void real() {
+        String inner = "}";
+    }
+
+    public void second() {
+    }
+}
+"""
+
+    cls = parse_java(source, "Trap.java")
+
+    assert cls is not None
+    assert [method.name for method in cls.methods] == ["real", "second"]
+
+
+def test_jdbc_template_sql_is_read_even_though_it_never_touches_a_mapper() -> None:
+    segment = (
+        'jdbcTemplate.query("SELECT 1 FROM bkp_routing_registry '
+        'WHERE table_schema=? AND table_name=?", ps)'
+    )
+
+    assert inline_sql_tables(segment) == [("select", ["bkp_routing_registry"])]
+
+
+def test_a_log_line_that_happens_to_say_from_is_not_a_table() -> None:
+    """`loaded from cache` 曾经被当成 from + cache。"""
+
+    assert inline_sql_tables('log.info("loaded from cache, size={}", n)') == []
+    assert inline_sql_tables('log.debug("update status from {} to {}", a, b)') == []
+
+
+def test_a_concatenated_table_name_is_declared_missing_not_guessed() -> None:
+    """静态解析的边界：`"SELECT * FROM " + table` 抽不到，就不该编一个。"""
+
+    assert inline_sql_tables('"SELECT * FROM " + table') == []
+
+
+def test_a_mapper_statement_carries_the_tables_it_reads() -> None:
+    namespace, statements = parse_mapper(BILLING_XML, "BillPaymentMapper.xml")
+
+    assert namespace == "com.demo.billing.mapper.BillPaymentMapper"
+    assert [(stmt_id, kind) for stmt_id, kind, _ in statements] == [
+        ("countByQuery", "select"),
+        ("selectPage", "select"),
+    ]
+    assert statements[1][2] == ["t_bill_payment", "dim_tenant"]
+
+
+def test_the_whole_chain_answers_which_tables_an_endpoint_touches(tmp_path: Path) -> None:
+    """接口 -> Controller -> Service 接口 -> 实现类 -> Mapper -> XML -> 表。"""
+
+    root = _billing_repo(tmp_path)
+    out = tmp_path / "graph.sqlite"
+    store(walk_roots([str(root)]), str(out))
+
+    conn = sqlite3.connect(out)
+    result = trace(conn, "POST /billing/list")
+
+    assert result["found"] is True
+    assert result["tables"] == ["dim_tenant", "t_bill_payment"]
+    assert set(result["statements"]) == {
+        "BillPaymentMapper.countByQuery",
+        "BillPaymentMapper.selectPage",
+    }
+
+
+def test_two_classes_with_the_same_simple_name_both_survive(tmp_path: Path) -> None:
+    """用简单名做键时会互相覆盖，10918 个文件只建出 8766 个类。"""
+
+    root = tmp_path / "api"
+    left = "a/src/main/java/com/demo/left"
+    right = "a/src/main/java/com/demo/right"
+    _write(root, f"{left}/OrderService.java", "package com.demo.left;\nclass OrderService {}\n")
+    _write(root, f"{right}/OrderService.java", "package com.demo.right;\nclass OrderService {}\n")
+
+    graph = walk_roots([str(root)])
+
+    assert len(graph.classes) == 2
